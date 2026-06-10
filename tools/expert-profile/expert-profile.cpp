@@ -459,6 +459,9 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = n_gpu_layers;
+    // mparams.split_mode         = LLAMA_SPLIT_MODE_TENSOR;
+    mparams.use_mmap           = false;
+    mparams.use_direct_io      = true;
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (!model) { LOG_ERR("expert-profile: failed to load model\n"); return 1; }
@@ -472,6 +475,9 @@ int main(int argc, char ** argv) {
     cparams.type_v                = kv_type_v;
     cparams.cb_eval               = expert_eval_callback;
     cparams.cb_eval_user_data     = nullptr;
+    cparams.flash_attn_type       = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+
+    // cparams.ctx_type              = LLAMA_CONTEXT_TYPE_MTP;
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) { LOG_ERR("expert-profile: failed to create context\n"); return 1; }

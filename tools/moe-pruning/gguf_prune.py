@@ -49,6 +49,7 @@ from gguf import GGUFReader, GGUFWriter, GGUFValueType
 EXPERT_BASE_SUFFIXES = {
     "ffn_up_exps",
     "ffn_down_exps",
+    "ffn_gate_exps",
     "ffn_gate_inp",
 }
 
@@ -199,7 +200,7 @@ def main():
             kept[il] = pick_experts(stats[il], keep_n)
             never = stats[il].get("never_activated", "?")
             crit  = "reap" if "reap" in stats[il] else "importance_score"
-            print(f"  Layer {il:3d}: keep {kept[il][:4]}…  never_activated={never}  criterion={crit}")
+            print(f"  Layer {il:3d}: keep {kept[il]}…  never_activated={never}  criterion={crit}")
 
     # ── Build output GGUF ──────────────────────────────────────────────────────
     print(f"\n[gguf-prune] writing  {args.output}")

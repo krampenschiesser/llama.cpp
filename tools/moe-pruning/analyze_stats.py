@@ -29,13 +29,13 @@ else:
     raise ValueError(f"No recognised score field in stats. Keys: {list(sample_layer.keys())}")
 
 # ── Model architecture constants (Nemotron-3-Nano-30B-A3B) ──────────────────
-N_EXPERTS        = 128
-N_EXPERT_USED    = 6       # top-k per token
-N_MOE_LAYERS     = 23
-N_TOTAL_LAYERS   = 53
+N_EXPERTS        = 288
+N_EXPERT_USED    = 8       # top-k per token
+N_MOE_LAYERS     = 42
+N_TOTAL_LAYERS   = 45
 # Approximate parameter counts (bf16, billions)
-PARAMS_TOTAL_B        = 30.0
-PARAMS_MOE_EXPERTS_B  = 22.0   # bulk of MoE weight is in expert FFNs
+PARAMS_TOTAL_B        = 198.0
+PARAMS_MOE_EXPERTS_B  = 190.0   # bulk of MoE weight is in expert FFNs
 PARAMS_NON_MOE_B      = PARAMS_TOTAL_B - PARAMS_MOE_EXPERTS_B
 
 # ── Header ──────────────────────────────────────────────────────────────────
