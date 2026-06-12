@@ -774,6 +774,7 @@ private:
         bool has_mmproj = !mmproj_path.empty();
         mtmd_context_params mparams = mtmd_context_params_default();
         if (has_mmproj) {
+            mparams.device           = params_base.mmproj_device;
             mparams.use_gpu          = params_base.mmproj_use_gpu;
             mparams.print_timings    = false;
             mparams.n_threads        = params_base.cpuparams.n_threads;

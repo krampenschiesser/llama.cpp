@@ -180,10 +180,11 @@ struct clip_ctx {
         }
         if (ctx_params.use_gpu) {
             auto * backend_name = std::getenv("MTMD_BACKEND_DEVICE");
-            if (backend_name != nullptr) {
-                backend = ggml_backend_init_by_name(backend_name, nullptr);
+            if (ctx_params.device != nullptr && backend_name != nullptr) {
+                backend = ggml_backend_dev_init(ctx_params.device, nullptr);
                 if (!backend) {
-                    LOG_WRN("%s: Warning: Failed to initialize \"%s\" backend, falling back to default GPU backend\n", __func__, backend_name);
+                    LOG_WRN("%s: Warning: Failed to initialize \"%s\" backend, falling back to default GPU backend\n",
+                            __func__, ggml_backend_dev_name(ctx_params.device));
                 }
             }
             if (!backend) {
