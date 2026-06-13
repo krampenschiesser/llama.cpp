@@ -631,6 +631,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {blck_size_perf};
         }
 
+        if (ud->model->arch == LLM_ARCH_STEP35) {
+            GGML_ASSERT(segments.size() == 1);
+            int64_t       cur_dev_cnt = llama_max_devices();
+            const int64_t n_devices   = ud->n_devices;
+            const int64_t max_el      = segments[0].first;
+            // allows for 4,8,9,10 devices, 5,6,7 need a better fix, and I don't have enough vram to test 1,2,3, although they should work
+            while (cur_dev_cnt > n_devices && cur_dev_cnt > 1) {
+                cur_dev_cnt /= 2;
+            }
+            return { max_el / cur_dev_cnt };
+        }
+
         // everything else
         GGML_ASSERT(segments.size() == 1);
         return {1};
