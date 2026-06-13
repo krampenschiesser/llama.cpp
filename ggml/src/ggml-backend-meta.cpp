@@ -483,7 +483,24 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return it->second[index];
 }
 
-static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
+static void log_split_state(const char *                          msg,
+                            const ggml_backend_meta_split_state & a,
+                            const struct ggml_tensor *            tensor) {
+    const size_t n_bufs    = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    std::string  a_ne_info = a.axis == 10 ? "axis=mirrored" :
+                             a.axis == 11 ? "axis=partial" :
+                                            "axis=" + std::to_string(a.axis);
+    for (size_t j = 0; j < n_bufs; j++) {
+        if (!a_ne_info.empty()) {
+            a_ne_info += ", ";
+        }
+        a_ne_info += std::to_string(a.ne[j]) + "x" + std::to_string(a.nr[0]);
+    }
+    GGML_LOG_DEBUG("## %s %s %s: {%s}\n", msg, tensor->name, ggml_op_name(tensor->op), a_ne_info.c_str());
+}
+
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor,
+                                                                              bool                       assume_sync);
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
@@ -507,9 +524,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 sum_b += b.ne[s*n_bufs + j] * b.nr[s];
             }
             if (sum_a != sum_b) {
+                log_split_state("split_states_equal.NOT_EQUAL for tensor A", a, tensor);
+                log_split_state("split_states_equal.NOT_EQUAL for tensor b", b, tensor);
+
                 return false;
             }
         }
+
+        log_split_state("split_states_equal.EQUAL for tensor a", a, tensor);
+        log_split_state("split_states_equal.EQUAL for tensor b", b, tensor);
+
         return true;
     };
 
@@ -522,7 +546,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
                 ret = src_ss[i];
             } else if (!split_states_equal(src_ss[i], ret)) {
-                ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+                GGML_LOG_DEBUG("## !split_states_equal(src_ss[i], ret) i=%li\n", i);
+                ret = { GGML_BACKEND_SPLIT_AXIS_UNKNOWN, { 0 }, { 1 }, 1 };
                 break;
             }
         }
@@ -783,20 +808,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
+        GGML_LOG_DEBUG("## CALCULATE_SPLIT_STATE for tensor %s %s[%f] [%li,%li,%li]}\n", tensor->name,
+                       ggml_op_name(tensor->op), ggml_get_op_params_f32(tensor, 0), tensor->ne[0], tensor->ne[1],
+                       tensor->ne[2]);
         if (ggml_nelements(tensor) == 0) {
-            return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+            return { GGML_BACKEND_SPLIT_AXIS_UNKNOWN, { 0 }, { 1 }, 1 };
         }
-        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
+        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            tensor->view_src == nullptr) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
+
+            log_split_state("Resolved split state dev_ctx->get_split_state", ret, tensor);
             if (ret.axis >= 0 && ret.axis <= GGML_MAX_DIMS) {
                 const int64_t granularity = ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1;
-                int64_t ne_sum = 0;
+                int64_t       ne_sum      = 0;
                 for (size_t s = 0; s < ret.n_segments; s++) {
                     for (size_t j = 0; j < n_bufs; j++) {
-                        GGML_ASSERT(ret.ne[s*n_bufs + j] % granularity == 0);
-                        ne_sum += ret.ne[s*n_bufs + j] * ret.nr[s];
+                        GGML_ASSERT(ret.ne[s * n_bufs + j] % granularity == 0);
+                        ne_sum += ret.ne[s * n_bufs + j] * ret.nr[s];
                     }
                 }
                 GGML_ASSERT(ne_sum == tensor->ne[ret.axis]);
@@ -804,127 +835,198 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return ret;
         }
 
-        std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
+        std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC,
+                                                          { GGML_BACKEND_SPLIT_AXIS_NONE, { 0 }, { 1 }, 1 });
+        GGML_LOG_DEBUG("## \tCurrent source stack for %s %s: \n", tensor->name, ggml_op_name(tensor->op));
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
-                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+                src_ss[i] = { GGML_BACKEND_SPLIT_AXIS_UNKNOWN, { 0 }, { 1 }, 1 };
                 continue;
             }
-            src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
+            src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/true);
+            if (&src_ss[i] == nullptr) {
+                // fixme chl
+                // assume we are at end of normal graph deps
+                // now need to ask model via userdata about additional dependencies given as tensor names
+                // then resolve and add into remainder and break;
+                GGML_LOG_DEBUG("## \t\tElement %li is null.\n", i);
+            } else {
+                GGML_LOG_DEBUG("## \t\tElement %li: ", i);
+                log_split_state(" ", src_ss[i], tensor->src[i]);
+            }
+
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         }
 
         ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
-            case GGML_OP_NONE: {
-                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
-            } break;
-            case GGML_OP_DUP: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
+            case GGML_OP_NONE:
+                {
+                    split_state = { GGML_BACKEND_SPLIT_AXIS_MIRRORED, { 0 }, { 1 }, 1 };
+                }
+                break;
+            case GGML_OP_DUP:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
             case GGML_OP_ADD:
-            case GGML_OP_ADD_ID: {
-                split_state = handle_bin_bcast(src_ss);
-            } break;
+            case GGML_OP_ADD_ID:
+                {
+                    split_state = handle_bin_bcast(src_ss);
+                }
+                break;
             case GGML_OP_ADD1:
-            case GGML_OP_ACC: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
+            case GGML_OP_ACC:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
             case GGML_OP_SUB:
             case GGML_OP_MUL:
-            case GGML_OP_DIV: {
-                split_state = handle_bin_bcast(src_ss);
-            } break;
+            case GGML_OP_DIV:
+                {
+                    split_state = handle_bin_bcast(src_ss);
+                }
+                break;
             case GGML_OP_SQR:
             case GGML_OP_SQRT:
             case GGML_OP_LOG:
             case GGML_OP_SIN:
-            case GGML_OP_COS: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-            } break;
-            case GGML_OP_SUM: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
+            case GGML_OP_COS:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/false);
+                }
+                break;
+            case GGML_OP_SUM:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
             case GGML_OP_SUM_ROWS:
             case GGML_OP_CUMSUM:
             case GGML_OP_MEAN:
             case GGML_OP_ARGMAX:
-            case GGML_OP_COUNT_EQUAL: {
-                split_state = handle_per_row(src_ss);
-            } break;
+            case GGML_OP_COUNT_EQUAL:
+                {
+                    split_state = handle_per_row(src_ss);
+                }
+                break;
             case GGML_OP_REPEAT:
-            case GGML_OP_REPEAT_BACK: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-            } break;
-            case GGML_OP_CONCAT: {
-                split_state = handle_concat(src_ss);
-            } break;
-            case GGML_OP_SILU_BACK: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-            } break;
+            case GGML_OP_REPEAT_BACK:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/false);
+                }
+                break;
+            case GGML_OP_CONCAT:
+                {
+                    split_state = handle_concat(src_ss);
+                }
+                break;
+            case GGML_OP_SILU_BACK:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/false);
+                }
+                break;
             case GGML_OP_NORM:
             case GGML_OP_RMS_NORM:
             case GGML_OP_RMS_NORM_BACK:
             case GGML_OP_GROUP_NORM:
-            case GGML_OP_L2_NORM: {
-                split_state = handle_per_row(src_ss);
-            } break;
+            case GGML_OP_L2_NORM:
+                {
+                    split_state = handle_per_row(src_ss);
+                }
+                break;
             case GGML_OP_MUL_MAT:
-            case GGML_OP_MUL_MAT_ID: {
-                split_state = handle_mul_mat(src_ss);
-            } break;
-            case GGML_OP_OUT_PROD: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
-            case GGML_OP_SCALE: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-            } break;
-            case GGML_OP_SET: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
-            case GGML_OP_CPY: {
-                split_state = handle_cpy(src_ss);
-            } break;
+            case GGML_OP_MUL_MAT_ID:
+                {
+                    split_state = handle_mul_mat(src_ss);
+                }
+                break;
+            case GGML_OP_OUT_PROD:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
+            case GGML_OP_SCALE:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/false);
+                }
+                break;
+            case GGML_OP_SET:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
+            case GGML_OP_CPY:
+                {
+                    split_state = handle_cpy(src_ss);
+                }
+                break;
             case GGML_OP_CONT:
-            case GGML_OP_RESHAPE: {
-                split_state = handle_reshape(src_ss);
-            } break;
-            case GGML_OP_VIEW: {
-                split_state = handle_view(src_ss);
-            } break;
-            case GGML_OP_PERMUTE: {
-                split_state = handle_permute(src_ss);
-            } break;
-            case GGML_OP_TRANSPOSE: {
-                split_state = handle_transpose(src_ss);
-            } break;
-            case GGML_OP_GET_ROWS: {
-                split_state = handle_get_rows(src_ss);
-            } break;
-            case GGML_OP_GET_ROWS_BACK: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
-            case GGML_OP_SET_ROWS: {
-                split_state = handle_set_rows(src_ss);
-            } break;
+            case GGML_OP_RESHAPE:
+                {
+                    split_state = handle_reshape(src_ss);
+                }
+                break;
+            case GGML_OP_VIEW:
+                {
+                    split_state = handle_view(src_ss);
+                }
+                break;
+            case GGML_OP_PERMUTE:
+                {
+                    split_state = handle_permute(src_ss);
+                }
+                break;
+            case GGML_OP_TRANSPOSE:
+                {
+                    split_state = handle_transpose(src_ss);
+                }
+                break;
+            case GGML_OP_GET_ROWS:
+                {
+                    split_state = handle_get_rows(src_ss);
+                }
+                break;
+            case GGML_OP_GET_ROWS_BACK:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
+            case GGML_OP_SET_ROWS:
+                {
+                    split_state = handle_set_rows(src_ss);
+                }
+                break;
             case GGML_OP_DIAG:
             case GGML_OP_DIAG_MASK_INF:
-            case GGML_OP_DIAG_MASK_ZERO: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
+            case GGML_OP_DIAG_MASK_ZERO:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
             case GGML_OP_SOFT_MAX:
-            case GGML_OP_SOFT_MAX_BACK: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-            } break;
-            case GGML_OP_ROPE: {
-                split_state = handle_rope(src_ss);
-            } break;
-            case GGML_OP_ROPE_BACK: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
-            case GGML_OP_CLAMP: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-            } break;
+            case GGML_OP_SOFT_MAX_BACK:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/false);
+                }
+                break;
+            case GGML_OP_ROPE:
+                {
+                    split_state = handle_rope(src_ss);
+                }
+                break;
+            case GGML_OP_ROPE_BACK:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
+            case GGML_OP_CLAMP:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/false);
+                }
+                break;
             case GGML_OP_CONV_TRANSPOSE_1D:
             case GGML_OP_IM2COL:
             case GGML_OP_IM2COL_BACK:
@@ -936,40 +1038,60 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_POOL_1D:
             case GGML_OP_POOL_2D:
             case GGML_OP_POOL_2D_BACK:
-            case GGML_OP_UPSCALE: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
-            case GGML_OP_PAD: {
-                split_state = handle_pad(src_ss);
-            } break;
+            case GGML_OP_UPSCALE:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
+            case GGML_OP_PAD:
+                {
+                    split_state = handle_pad(src_ss);
+                }
+                break;
             case GGML_OP_PAD_REFLECT_1D:
             case GGML_OP_ROLL:
             case GGML_OP_ARANGE:
-            case GGML_OP_TIMESTEP_EMBEDDING: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
+            case GGML_OP_TIMESTEP_EMBEDDING:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
             case GGML_OP_ARGSORT:
-            case GGML_OP_TOP_K: {
-                split_state = handle_per_row(src_ss);
-            } break;
-            case GGML_OP_LEAKY_RELU: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-            } break;
-            case GGML_OP_TRI: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
-            case GGML_OP_FILL: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-            } break;
-            case GGML_OP_FLASH_ATTN_EXT: {
-                split_state = handle_flash_attn_ext(src_ss);
-            } break;
-            case GGML_OP_FLASH_ATTN_BACK: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
-            case GGML_OP_SSM_CONV: {
-                split_state = handle_ssm_conv(src_ss);
-            } break;
+            case GGML_OP_TOP_K:
+                {
+                    split_state = handle_per_row(src_ss);
+                }
+                break;
+            case GGML_OP_LEAKY_RELU:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/false);
+                }
+                break;
+            case GGML_OP_TRI:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
+            case GGML_OP_FILL:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/false);
+                }
+                break;
+            case GGML_OP_FLASH_ATTN_EXT:
+                {
+                    split_state = handle_flash_attn_ext(src_ss);
+                }
+                break;
+            case GGML_OP_FLASH_ATTN_BACK:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
+            case GGML_OP_SSM_CONV:
+                {
+                    split_state = handle_ssm_conv(src_ss);
+                }
+                break;
             case GGML_OP_SSM_SCAN:
             case GGML_OP_WIN_PART:
             case GGML_OP_WIN_UNPART:
@@ -978,51 +1100,69 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_RWKV_WKV6:
             case GGML_OP_GATED_LINEAR_ATTN:
             case GGML_OP_RWKV_WKV7:
-            case GGML_OP_SOLVE_TRI: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
-            case GGML_OP_GATED_DELTA_NET: {
-                split_state = handle_gated_delta_net(src_ss);
-            } break;
-            case GGML_OP_UNARY: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-            } break;
+            case GGML_OP_SOLVE_TRI:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
+            case GGML_OP_GATED_DELTA_NET:
+                {
+                    split_state = handle_gated_delta_net(src_ss);
+                }
+                break;
+            case GGML_OP_UNARY:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/false);
+                }
+                break;
             case GGML_OP_MAP_CUSTOM1:
             case GGML_OP_MAP_CUSTOM2:
             case GGML_OP_MAP_CUSTOM3:
-            case GGML_OP_CUSTOM: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
+            case GGML_OP_CUSTOM:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/true);
+                }
+                break;
             case GGML_OP_CROSS_ENTROPY_LOSS:
-            case GGML_OP_CROSS_ENTROPY_LOSS_BACK: {
-                split_state = handle_per_row(src_ss);
-            } break;
+            case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+                {
+                    split_state = handle_per_row(src_ss);
+                }
+                break;
             case GGML_OP_OPT_STEP_ADAMW:
             case GGML_OP_OPT_STEP_SGD:
-            case GGML_OP_GLU: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-            } break;
-            default: {
-                GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
-                split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
-            } break;
+            case GGML_OP_GLU:
+                {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/false);
+                }
+                break;
+            default:
+                {
+                    GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
+                    split_state = { GGML_BACKEND_SPLIT_AXIS_UNKNOWN, { 0 }, { 1 }, 1 };
+                }
+                break;
         }
+
+        log_split_state("\tAFTER ALL OPS calculate_split_state", split_state, tensor);
         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
-            bool first_src_split_by_axis = true;
-            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            bool         first_src_split_by_axis = true;
+            const size_t n_bufs                  = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
                 if (tensor->src[i] == nullptr || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
                     continue;
                 }
+                //here chl
                 if (first_src_split_by_axis) {
+                    log_split_state("\tBEFORE first_src_split_by_axis", split_state, tensor);
                     for (size_t j = 0; j < n_bufs; j++) {
                         // Take over ratio from src:
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
-                            split_state.ne[s*n_bufs + j] = 0;
+                            split_state.ne[s * n_bufs + j] = 0;
                         }
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
-                            split_state.ne[j] += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
+                            split_state.ne[j] += src_ss[i].ne[s * n_bufs + j] * src_ss[i].nr[s];
                         }
                         split_state.ne[j] *= tensor->ne[split_state.axis];
                         if (split_state.ne[j] != 0 || tensor->src[i]->ne[src_ss[i].axis] != 0) {
@@ -1031,22 +1171,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                             split_state.ne[j] /= div;
                         }
                     }
+
+                    log_split_state("\tAFTER first_src_split_by_axis", split_state, tensor);
                 } else {
                     GGML_ASSERT(split_state.n_segments == 1);
                     for (size_t j = 0; j < n_bufs; j++) {
                         // Assert that ratio is consistent:
                         int64_t sum = 0;
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
-                            sum += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
+                            sum += src_ss[i].ne[s * n_bufs + j] * src_ss[i].nr[s];
                         }
-                        GGML_ASSERT(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
-                                                                 == sum * tensor->ne[split_state.axis]);
+                        GGML_ASSERT(split_state.ne[j] * split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis] ==
+                                    sum * tensor->ne[split_state.axis]);
                     }
                 }
                 first_src_split_by_axis = false;
             }
             GGML_ASSERT(!first_src_split_by_axis);
         }
+
+        log_split_state("Final split state after calculation:", split_state, tensor);
         return split_state;
     };
 
@@ -1140,6 +1284,8 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
+
+    log_split_state("BEGIN buffer init tensor", split_state, tensor);
     for (size_t j = 0; j < n_simple_bufs; j++) {
         ggml_context          * simple_ctx = stc.ctxs[j].get();
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
@@ -1149,6 +1295,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             // GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
             ne[split_dim] = 0;
             for (size_t s = 0; s < split_state.n_segments; s++) {
+                // here chl, loaded tensor init
                 ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
             }
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
@@ -1209,6 +1356,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 
         simple_tensors.push_back(t_ij);
     }
+    log_split_state("END buffer init tensor", split_state, tensor);
 
     // If one of the sources has a zero-sized slice, disable the computation:
     for (int i = 0; i < GGML_MAX_SRC; i++) {

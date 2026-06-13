@@ -268,20 +268,21 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
             // head-wise attention gate: sigmoid(g_proj(x)) in torch
             if (model.layers[il].wqkv_gate) {
                 ggml_tensor * gate = build_lora_mm(model.layers[il].wqkv_gate, cur); // [n_head_l, n_tokens]
+
                 cb(gate, "attn_gate", il);
 
-                gate = ggml_sigmoid(ctx0, gate);
-                cb(gate, "attn_gate_sigmoid", il);
+                ggml_tensor * sigmoid = ggml_sigmoid(ctx0, gate);
+                cb(sigmoid, "attn_gate_sigmoid", il);
 
                 // reshape + broadcast to [n_embd_head_v, n_head_l, n_tokens]
                 ggml_tensor * attn_3d = ggml_reshape_3d(ctx0, attn_out, n_embd_head_v, n_head_l, n_tokens);
-                ggml_tensor * gate_3d = ggml_reshape_3d(ctx0, gate,       1,          n_head_l, n_tokens);
+                ggml_tensor * gate_3d = ggml_reshape_3d(ctx0, sigmoid, 1, n_head_l, n_tokens);
                 cb(gate_3d, "attn_gate_3d", il);
 
-                attn_3d = ggml_mul(ctx0, attn_3d, gate_3d);
-                cb(attn_3d, "attn_gated_3d", il);
+                ggml_tensor * attn_gated_3d = ggml_mul(ctx0, attn_3d, gate_3d);
+                cb(attn_gated_3d, "attn_gated_3d", il);
 
-                attn_out = ggml_reshape_2d(ctx0, attn_3d, n_embd_head_v * n_head_l, n_tokens);
+                attn_out = ggml_reshape_2d(ctx0, attn_gated_3d, n_embd_head_v * n_head_l, n_tokens);
                 cb(attn_out, "attn_gated", il);
             }
 

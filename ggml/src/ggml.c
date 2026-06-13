@@ -251,6 +251,9 @@ GGML_API ggml_abort_callback_t ggml_set_abort_callback(ggml_abort_callback_t cal
 
 void ggml_abort(const char * file, int line, const char * fmt, ...) {
     fflush(stdout);
+    fflush(stderr);
+
+    sleep(2);
 
     char message[2048];
     int offset = snprintf(message, sizeof(message), "%s:%d: ", file, line);

@@ -554,19 +554,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {{tensor->ne[axis], 1}};
     };
 
-    auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+    auto get_split_granularity =
+        [&](int64_t blck_size, uint32_t il,
+            const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention
             const int64_t head_dim        = hparams.ssm_d_state;
             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
             const int64_t granularity_qkv = std::lcm(blck_size_perf, head_dim);
-            if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_attn_gate_weight) ||
-                    std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+            if (std::regex_match(tensor_name, pattern_qkv_weight) ||
+                std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+                std::regex_match(tensor_name, pattern_ssm_conv1d) ||
+                std::regex_match(tensor_name, pattern_ssm_out_weight)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv);
             }
             if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
-                    std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta)) {
+                std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv / head_dim);
             }
             if (std::regex_match(tensor_name, pattern_ssm_beta_alpha)) {
@@ -585,53 +589,65 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
             // to handle head sizes like 80, only increase granularity while it doesn't cause underutilization
             int64_t blck_size_perf = blck_size;
-            while (blck_size_perf < 128 && blck_size_perf*ud->n_devices < n_embd_q) {
+            while (blck_size_perf < 128 && blck_size_perf * ud->n_devices < n_embd_q) {
                 blck_size_perf *= 2;
             }
 
             if (std::regex_match(tensor_name, pattern_attn_sinks)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {std::lcm(n_embd_q, blck_size_perf)/n_embd_q * n_gqa};
+                return { std::lcm(n_embd_q, blck_size_perf) / n_embd_q * n_gqa };
             }
 
             const int64_t granularity_q = std::lcm(n_embd_q, blck_size_perf);
             if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias)) {
                 GGML_ASSERT(segments.size() == 1);
                 // some models have Q gate tensors, for those cases the granularity needs to be doubled:
-                if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
-                    return {std::lcm(2*n_embd_q, blck_size_perf)};
+                if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 ||
+                    ud->model->arch == LLM_ARCH_QWEN35MOE) {
+                    return { std::lcm(2 * n_embd_q, blck_size_perf) };
                 }
-                return {granularity_q};
+                return { granularity_q };
             }
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {granularity_q};
+                return { granularity_q };
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
-            if (std::regex_match(tensor_name, pattern_kv_weight) ||
-                std::regex_match(tensor_name, pattern_kv_bias) ||
+            if (std::regex_match(tensor_name, pattern_kv_weight) || std::regex_match(tensor_name, pattern_kv_bias) ||
                 std::regex_match(tensor_name, pattern_kv_cache)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {granularity_kv};
+                return { granularity_kv };
             }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
                 GGML_ASSERT(segments.size() == 2);
-                return {granularity_q, granularity_kv};
+                return { granularity_q, granularity_kv };
             }
         }
 
         // FFN
-        if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight) || std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
-                std::regex_match(tensor_name, pattern_ffn_gate_up_weight) || std::regex_match(tensor_name, pattern_ffn_down_weight)) {
+        if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight) ||
+            std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
+            std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+            std::regex_match(tensor_name, pattern_ffn_down_weight)) {
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
-            return {blck_size_perf};
+            return { blck_size_perf };
         }
-
+        if (ud->model->arch == LLM_ARCH_STEP35) {
+            GGML_ASSERT(segments.size() == 1);
+            int64_t       cur_dev_cnt = llama_max_devices();
+            const int64_t n_devices   = ud->n_devices;
+            const int64_t max_el      = segments[0].first;
+            // allows for 4,8,9,10 devices, 5,6,7 need a better fix, and I don't have enough vram to test 1,2,3, although they should work
+            while (cur_dev_cnt > n_devices && cur_dev_cnt > 1) {
+                cur_dev_cnt /= 2;
+            }
+            return { max_el / cur_dev_cnt };
+        }
         // everything else
         GGML_ASSERT(segments.size() == 1);
-        return {1};
+        return { 1 };
     };
 
     ggml_backend_meta_split_state split_state;
@@ -654,19 +670,29 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
-            const int64_t  g_s  = granularity[is];
-            int64_t low = 0;
-            size_t j = 0;
+            int64_t        g_s  = granularity[is];
+            int64_t        low  = 0;
+            size_t         j    = 0;
             for (; j < ud->n_devices - 1; j++) {
                 int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
+                                   ne_s * (j + 1) / ud->n_devices :
+                                   ne_s * tensor_split_scan[j] / tensor_split_scan.back();
                 if (high % g_s != 0) {
                     high -= high % g_s;
                 }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
+                auto index    = is * ud->n_devices + (j + tc.rotation) % ud->n_devices;
+                auto next_val = high - low;
+
+                split_state.ne[index] = next_val;
+                LLAMA_LOG_DEBUG(
+                    "## %s granularity=%li, ne_s=%li, nr_s=%i j=%li, high=%li, low=%li, rot=%li ne[%li]=%li\n",
+                    tensor->name, g_s, ne_s, nr_s, j, high, low, tc.rotation, index, split_state.ne[index]);
                 low = high;
             }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
+            auto index            = is * ud->n_devices + (j + tc.rotation) % ud->n_devices;
+            split_state.ne[index] = ne_s - low;
+            LLAMA_LOG_DEBUG("## %s low=%li, ne[%li]=%li\n", tensor->name, low, index, split_state.ne[index]);
+
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
@@ -675,6 +701,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         split_state.nr[0] = 1;
         split_state.n_segments = 1;
     }
+
     return split_state;
     GGML_UNUSED(userdata);
 }
