@@ -1337,6 +1337,13 @@ struct llama_model_eagle3 : public llama_model_base {
 
 struct llama_model_dflash : public llama_model_base {
     llama_model_dflash(const struct llama_model_params & params) : llama_model_base(params) {}
+
+    // Laguna drafters use the target arch's decoder contract; set by dflash.decoder_arch
+    bool decoder_laguna = false;
+
+    // stacked per-aux feature norms [n_embd, n_aux]
+    struct ggml_tensor * aux_norm = nullptr;
+
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 

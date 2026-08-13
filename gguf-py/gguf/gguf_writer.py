@@ -996,6 +996,9 @@ class GGUFWriter:
     def add_norm_before_residual(self, value: bool) -> None:
         self.add_bool(Keys.LLM.NORM_BEFORE_RESIDUAL.format(arch=self.arch), value)
 
+    def add_decoder_arch(self, value: str) -> None:
+        self.add_string(Keys.LLM.DECODER_ARCH.format(arch=self.arch), value)
+
     def add_norm_before_fc(self, value: bool) -> None:
         self.add_bool(Keys.LLM.NORM_BEFORE_FC.format(arch=self.arch), value)
 
