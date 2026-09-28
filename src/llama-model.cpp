@@ -420,6 +420,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
 
+    static const std::regex pattern_ssm_f_a_weight  ("blk\\.\\d*\\.ssm_f_a.weight");
+    static const std::regex pattern_ssm_g_a_weight  ("blk\\.\\d*\\.ssm_g_a.weight");
+    static const std::regex pattern_ssm_conv1d_qkv  ("blk\\.\\d*\\.ssm_conv1d_[qkv].weight");
+    static const std::regex pattern_attn_k_b_weight ("blk\\.\\d*\\.attn_k_b.weight");
+    static const std::regex pattern_attn_v_b_weight ("blk\\.\\d*\\.attn_v_b.weight");
+
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
 
@@ -502,6 +508,55 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
+        }
+
+        // BailingMoE3 KDA layers are replicated: their strided conv-state cache cannot be split
+        if (ud->model->arch == LLM_ARCH_BAILINGMOE3) {
+            if (std::regex_match(tensor_name, pattern_kv_cache)) {
+                // MLA uses a single shared KV head
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            int il = -1;
+            const size_t length_prefix = tensor_name.substr(0, 4) == "blk." ? tensor_name.find('.', 4) : std::string::npos;
+            if (length_prefix != std::string::npos) {
+                il = std::stoi(tensor_name.substr(4, length_prefix - 4));
+            }
+            const bool is_recr_cache = std::regex_match(tensor_name, pattern_r_cache) ||
+                std::regex_match(tensor_name, pattern_s_cache);
+            if (is_recr_cache || (il >= 0 && hparams.is_recr(il))) {
+                if (is_recr_cache ||
+                        std::regex_match(tensor_name, pattern_q_weight) ||
+                        std::regex_match(tensor_name, pattern_kv_weight) ||
+                        std::regex_match(tensor_name, pattern_attn_out_weight) ||
+                        std::regex_match(tensor_name, pattern_ssm_conv1d_qkv) ||
+                        std::regex_match(tensor_name, pattern_ssm_f_a_weight) ||
+                        std::regex_match(tensor_name, pattern_ssm_g_a_weight) ||
+                        std::regex_match(tensor_name, pattern_ssm_dt) ||
+                        std::regex_match(tensor_name, pattern_ssm_a) ||
+                        std::regex_match(tensor_name, pattern_ssm_beta)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
+            } else if (il < 0 || hparams.n_head(il) < 2 || hparams.n_head(il) % 2 != 0) {
+                // CUDA flash attention needs >= 2 query heads per device for the MLA head size, so
+                //     an odd or single head count keeps the layer replicated
+                if (std::regex_match(tensor_name, pattern_q_weight) ||
+                        std::regex_match(tensor_name, pattern_attn_q_b_weight) ||
+                        std::regex_match(tensor_name, pattern_attn_k_b_weight) ||
+                        std::regex_match(tensor_name, pattern_attn_v_b_weight) ||
+                        std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+                        std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
+            } else {
+                // MLA: split by head, the K/V latent itself stays replicated (single KV head)
+                if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+                }
+                if (std::regex_match(tensor_name, pattern_attn_k_b_weight) ||
+                        std::regex_match(tensor_name, pattern_attn_v_b_weight)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+                }
             }
         }
 
@@ -695,6 +750,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
+        // BailingMoE3 MLA splits land on groups of 2 q/k/v heads so flash attention keeps gqa_ratio >= 2
+        if (ud->model->arch == LLM_ARCH_BAILINGMOE3 && !hparams.is_recr(il)) {
+            const int64_t head_unit   = 2;
+            const int64_t qk_head_dim = hparams.n_embd_head_k_mla();
+            const int64_t v_head_dim  = hparams.n_embd_head_v_mla();
+            if (std::regex_match(tensor_name, pattern_attn_q_b_weight) ||
+                    std::regex_match(tensor_name, pattern_q_weight)) {
+                return {head_unit * qk_head_dim};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                return {head_unit * v_head_dim};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+                    std::regex_match(tensor_name, pattern_attn_k_b_weight) ||
+                    std::regex_match(tensor_name, pattern_attn_v_b_weight)) {
+                return {head_unit};
+            }
+        }
         if (hparams.is_recr(il)) {
             // linear attention
             const int64_t head_dim        = hparams.ssm_d_state;
