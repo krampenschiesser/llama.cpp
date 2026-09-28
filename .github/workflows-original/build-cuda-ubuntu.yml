@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - sks
+      - master
     paths: [
       '.github/workflows/build-cuda-ubuntu.yml',
       '**/CMakeLists.txt',
