@@ -3058,6 +3058,47 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
+static bool ggml_cpu_tensors_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    if (a->buffer == NULL || b->buffer == NULL) {
+        return true;
+    }
+    const int64_t a0 = (int64_t) a->data, a1 = a0 + (int64_t) ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+    const int64_t b0 = (int64_t) b->data, b1 = b0 + (int64_t) ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+    return a0 < b1 && b0 < a1;
+}
+
+// match scale_out*sigmoid(scale_in*post) feeding dsv4_hc_post (qwen4exp hc_combine)
+static bool ggml_cpu_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int node_n) {
+    if (node_n + 4 > cgraph->n_nodes) {
+        return false;
+    }
+
+    const enum ggml_op fuse_ops[] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
+    const int node_idxs[] = { node_n, node_n + 1, node_n + 2, node_n + 3 };
+    const int outputs[]   = { node_n + 3 };
+
+    if (!ggml_can_fuse_subgraph_ext(cgraph, node_idxs, 4, fuse_ops, outputs, 1)) {
+        return false;
+    }
+
+    const struct ggml_tensor * scale_in  = cgraph->nodes[node_n];
+    const struct ggml_tensor * sigmoid   = cgraph->nodes[node_n + 1];
+    const struct ggml_tensor * scale_out = cgraph->nodes[node_n + 2];
+    const struct ggml_tensor * hc_post   = cgraph->nodes[node_n + 3];
+
+    if (sigmoid->src[0] != scale_in || scale_out->src[0] != sigmoid || hc_post->src[2] != scale_out) {
+        return false;
+    }
+
+    // the fused kernel folds scale -> sigmoid -> scale; a bias on either scale is not handled
+    return ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
+           ggml_get_op_params_f32(scale_in,  1) == 0.0f &&
+           ggml_get_op_params_f32(scale_out, 1) == 0.0f &&
+           scale_in->src[0]->type == GGML_TYPE_F32 &&
+           ggml_are_same_shape(scale_in->src[0], scale_out) &&
+           !ggml_cpu_tensors_overlap(scale_in->src[0], hc_post);
+}
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3087,6 +3128,12 @@ static int ggml_cpu_try_fuse_ops(
                 return 1;
             }
         }
+    }
+
+    if (node->op == GGML_OP_SCALE && ggml_cpu_can_fuse_hc_post_gate(cgraph, node_n)) {
+        ggml_compute_forward_dsv4_hc_post_gated(params, cgraph->nodes[node_n + 3],
+                cgraph->nodes[node_n], cgraph->nodes[node_n + 2]);
+        return 3;
     }
 
     return 0;
