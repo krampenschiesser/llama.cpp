@@ -3438,6 +3438,37 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// match qwen4exp's hc_combine gate: scale_out*sigmoid(scale_in*post) feeding dsv4_hc_post
+static bool ggml_cuda_match_hc_post_gate(const ggml_cgraph * cgraph, int node_idx) {
+    static const std::initializer_list<enum ggml_op> ops = {
+        GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST
+    };
+
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
+        return false;
+    }
+    if (!ggml_check_edges(cgraph, node_idx, { { 1, 0, 0 }, { 2, 0, 1 }, { 3, 2, 2 } })) {
+        return false;
+    }
+
+    const ggml_tensor * scale_in  = cgraph->nodes[node_idx];
+    const ggml_tensor * sigmoid   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * scale_out = cgraph->nodes[node_idx + 2];
+
+    // the kernel folds scale -> sigmoid -> scale; a bias on either scale is not handled
+    // the gated kernel stages the gate in dynamic shared memory, so cap hc at the 48 KiB default
+    const int64_t hc = scale_out->ne[0];
+    if ((hc + hc*hc) * (int64_t) sizeof(float) > 48*1024) {
+        return false;
+    }
+
+    return ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
+           ggml_get_op_params_f32(scale_in,  1) == 0.0f &&
+           ggml_get_op_params_f32(scale_out, 1) == 0.0f &&
+           scale_in->src[0]->type == GGML_TYPE_F32 &&
+           ggml_are_same_shape(scale_in->src[0], scale_out);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4195,6 +4226,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    if (node->op == GGML_OP_SCALE && ggml_cuda_match_hc_post_gate(cgraph, i)) {
+        const int output_idx = i + 3;
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &output_idx, 1)) {
+            ggml_cuda_op_dsv4_hc_post_gated(*cuda_ctx,
+                    cgraph->nodes[i + 3], cgraph->nodes[i], cgraph->nodes[i + 2]);
+            return 3;
+        }
+    }
+
     return 0;
 }
 
@@ -4605,6 +4645,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         }
                     }
                 }
+            }
+
+            if (cgraph->nodes[i]->op == GGML_OP_SCALE && ggml_cuda_match_hc_post_gate(cgraph, i)) {
+                // the fused hc_post reads the raw gate, keep it alive until then
+                params->add_alloc_dep(params->user_data,
+                        const_cast<ggml_tensor *>(cgraph->nodes[i]->src[0]), cgraph->nodes[i + 3]);
+                i += 3;
             }
         }
     }

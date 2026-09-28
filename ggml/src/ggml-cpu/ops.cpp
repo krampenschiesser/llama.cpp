@@ -11327,10 +11327,13 @@ void ggml_compute_forward_dsv4_hc_pre(
 
 static void ggml_compute_forward_dsv4_hc_post_f32(
         const ggml_compute_params * params,
-        ggml_tensor * dst) {
+        ggml_tensor * dst,
+        const ggml_tensor * post,
+        const bool gated,
+        const float gate_scale_in,
+        const float gate_scale_out) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
-    const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
@@ -11377,15 +11380,24 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     const int64_t ir0 = dr * ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
+    int64_t gate_row = -1;
+    float   gate     = 0.0f;
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t i0     = ir % n_embd;
         const int64_t idst   = (ir / n_embd) % hc;
         const int64_t it     = ir / (n_embd * hc);
 
-        const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
-        const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+        // the gate is constant across i0, so evaluate 2*sigmoid(gate/hc) once per row
+        if (idst + hc*it != gate_row) {
+            const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+            gate     = gated ? gate_scale_out / (1.0f + expf(-(gate_scale_in * pv))) : pv;
+            gate_row = idst + hc*it;
+        }
 
-        float sum = xv * pv;
+        const float xv = *(const float *) ((const char *) x->data + i0*nbx0 + it*nbx1);
+
+        float sum = xv * gate;
         if (comb) {
             for (int64_t isrc = 0; isrc < hc; ++isrc) {
                 const float rv = *(const float *) ((const char *) residual->data + i0*nbr0 + isrc*nbr1 + it*nbr2);
@@ -11408,7 +11420,30 @@ void ggml_compute_forward_dsv4_hc_post(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_dsv4_hc_post_f32(params, dst);
+                ggml_compute_forward_dsv4_hc_post_f32(params, dst, dst->src[2], false, 0.0f, 0.0f);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// fusion of scale + sigmoid + scale + dsv4_hc_post: dst->src[2] is replaced by the raw
+// gate scale_in->src[0] and the two scales are folded into the kernel
+void ggml_compute_forward_dsv4_hc_post_gated(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        ggml_tensor * scale_in,
+        ggml_tensor * scale_out) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_dsv4_hc_post_f32(params, dst, scale_in->src[0], true,
+                        ggml_get_op_params_f32(scale_in,  0),
+                        ggml_get_op_params_f32(scale_out, 0));
             } break;
         default:
             {
