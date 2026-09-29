@@ -13,7 +13,6 @@
 #include <cstring>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -1421,33 +1420,56 @@ static void ggml_backend_meta_buffer_memset_tensor(
     }
 }
 
+// Whether the devices behind a meta device provide real (pinned) host buffers. When pinning is
+// disabled (e.g. GGML_CUDA_NO_PINNED) the host buffer falls back to pageable memory and staging
+// would only add a copy, so callers must skip it.
+static bool ggml_backend_meta_host_is_pinned(ggml_backend_dev_t dev) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(simple_dev, &props);
+        if (!props.caps.host_buffer) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Returns a reusable pinned host staging buffer of at least `need` bytes for `buffer`'s
 // device, or nullptr if pinned memory is unavailable. Staging a split tensor through pinned
-// memory avoids the very slow pageable cudaMemcpy2D path (many short strided rows).
+// memory avoids the very slow pageable cudaMemcpy2D path (many short strided rows). The state is
+// thread-local so concurrent model loads never share the buffer.
 static void * ggml_backend_meta_staging(ggml_backend_buffer_t buffer, size_t need) {
-    static std::mutex mtx;
-    std::lock_guard<std::mutex> lock(mtx);
-
-    static ggml_backend_buffer_t buf = nullptr;
-    static ggml_backend_dev_t    dev = nullptr;
-    static void *                ptr = nullptr;
-    static size_t                cap = 0;
+    thread_local ggml_backend_buffer_t buf    = nullptr;
+    thread_local ggml_backend_dev_t    dev    = nullptr;
+    thread_local void *                ptr    = nullptr;
+    thread_local size_t                cap    = 0;
+    thread_local bool                  pinned = false;
 
     ggml_backend_dev_t cur = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
     if (cur == nullptr) {
         return nullptr;
     }
-    if (ptr != nullptr && cap >= need && cur == dev) {
+    if (cur != dev) {
+        if (buf != nullptr) {
+            ggml_backend_buffer_free(buf);
+            buf = nullptr; ptr = nullptr; cap = 0;
+        }
+        dev    = cur;
+        pinned = ggml_backend_meta_host_is_pinned(cur);
+    }
+    if (!pinned) {
+        return nullptr;
+    }
+    if (ptr != nullptr && cap >= need) {
         return ptr;
     }
     // Grow geometrically to avoid repeated (expensive) pin/unpin on every larger tensor.
-    size_t new_cap = need;
-    if (cur == dev && cap > 0 && cap < need) {
-        new_cap = std::max(need, cap * 2);
-    }
+    const size_t new_cap = cap > 0 && cap < need ? std::max(need, cap * 2) : need;
     if (buf != nullptr) {
         ggml_backend_buffer_free(buf);
-        buf = nullptr; ptr = nullptr; cap = 0; dev = nullptr;
+        buf = nullptr; ptr = nullptr; cap = 0;
     }
     ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(cur);
     if (host_buft == nullptr) {
@@ -1460,7 +1482,6 @@ static void * ggml_backend_meta_staging(ggml_backend_buffer_t buffer, size_t nee
     buf = nb;
     ptr = ggml_backend_buffer_get_base(nb);
     cap = new_cap;
-    dev = cur;
     return ptr;
 }
 
