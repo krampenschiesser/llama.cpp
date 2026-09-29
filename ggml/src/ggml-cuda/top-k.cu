@@ -273,3 +273,218 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #endif // defined(GGML_USE_HIP)
 #endif
 }
+
+// match qwen4exp's QSA indexer: get_rows -> ... -> add(f16 mask) -> top_k
+bool ggml_cuda_match_topk_qsa(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_qsa_match & match) {
+    static const std::initializer_list<enum ggml_op> ops = {
+        GGML_OP_GET_ROWS, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_TOP_K
+    };
+
+    const int n_ops = (int) ops.size();
+    if (node_idx + n_ops > cgraph->n_nodes) {
+        return false;
+    }
+    for (int j = 0; j < n_ops; ++j) {
+        const ggml_tensor * node = cgraph->nodes[node_idx + j];
+        if (node->op != ops.begin()[j] || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            (j < n_ops - 1 && (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0)) {
+            return false;
+        }
+    }
+    if (!ggml_check_edges(cgraph, node_idx,
+            { { 1, 0, 0 }, { 2, 0, 1 }, { 4, 0, 3 }, { 5, 0, 2 }, { 5, 1, 4 }, { 6, 0, 5 } })) {
+        return false;
+    }
+
+    // elided nodes must be single-use (cpy counts its own src[1] self-reference)
+    for (int j = 0; j < n_ops - 1; ++j) {
+        const ggml_tensor * node = cgraph->nodes[node_idx + j];
+        const int32_t want = node->op == GGML_OP_CPY ? 2 : 1;
+        if (ggml_node_get_use_count(cgraph, node_idx + j) != want) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * get_rows = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * add      = cgraph->nodes[node_idx + 5];
+    ggml_tensor *       top_k    = cgraph->nodes[node_idx + 6];
+
+    const ggml_tensor * scores   = get_rows->src[0]; // [n_tps, n_blocks, n_stream]
+    const ggml_tensor * cell_blk = get_rows->src[1]; // [n_kv, n_stream]
+    const ggml_tensor * expanded = add->src[0];      // [n_kv, n_tps, n_stream]
+
+    // raw mask: follow the reshape/cpy chain back to the materialized f16 input
+    const ggml_tensor * mask = add->src[1];
+    while (mask && (mask->op == GGML_OP_RESHAPE || mask->op == GGML_OP_CPY)) {
+        mask = mask->src[0];
+    }
+    if (!mask || mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    if (scores->type != GGML_TYPE_F32 || cell_blk->type != GGML_TYPE_I32 || top_k->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(scores) || !ggml_is_contiguous(cell_blk) || !ggml_is_contiguous(mask) ||
+        !ggml_is_contiguous(expanded) || !ggml_is_contiguous(top_k)) {
+        return false;
+    }
+
+    const int64_t n_tps    = scores->ne[0];
+    const int64_t n_blocks = scores->ne[1];
+    const int64_t n_stream = scores->ne[2];
+    const int64_t n_kv     = cell_blk->ne[0];
+    const int64_t width    = top_k->ne[0];
+
+    // pin the indexer layout the kernel addressing assumes
+    if (scores->ne[3] != 1 || cell_blk->ne[1] != n_stream || ggml_nrows(cell_blk) != n_stream ||
+        ggml_nelements(mask) != n_kv * n_tps * n_stream || expanded->ne[0] != n_kv || expanded->ne[1] != n_tps ||
+        expanded->ne[2] != n_stream || top_k->ne[1] != n_tps || top_k->ne[2] != n_stream || top_k->ne[3] != 1 ||
+        n_blocks <= 0 || n_kv <= 0 || width <= 0 || width > n_kv) {
+        return false;
+    }
+
+    // small k is faster with the unfused top_k path
+    if (width <= 256) {
+        return false;
+    }
+
+    match.scores   = scores;
+    match.cell_blk = cell_blk;
+    match.mask     = mask;
+    match.top_k    = top_k;
+    return true;
+}
+
+static __device__ __forceinline__ uint32_t topk_qsa_float_to_ordered(float value) {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t mask = (uint32_t) (-(int32_t) (bits >> 31)) | 0x80000000U;
+    return bits ^ mask;
+}
+
+// one block per output row; radix-select the top width cells by gathered key
+template<int BLOCK_SIZE, int RADIX_BITS>
+static __global__ void topk_qsa_kernel(
+        const float * __restrict__ scores,
+        const int32_t * __restrict__ cell_blk,
+        const ggml_half * __restrict__ mask,
+        int32_t * __restrict__ top_k,
+        int n_kv,
+        int width,
+        int n_tps,
+        int n_blocks,
+        int n_stream) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int t   = row % n_tps;
+    const int s   = row / n_tps;
+
+    const int32_t *  row_cell   = cell_blk + (size_t) s * n_kv;
+    const ggml_half * row_mask  = mask + ((size_t) s * n_tps + t) * n_kv;
+    const float *    row_scores = scores + (size_t) s * n_blocks * n_tps;
+    int32_t *        row_out    = top_k + (size_t) row * width;
+
+    __shared__ int histogram[NBINS];
+    __shared__ int s_bucket;
+    __shared__ int s_above;
+    __shared__ int out_count;
+
+    uint32_t prefix  = 0;
+    int      desired = width;
+
+    // four 8-bit passes, most significant bucket first
+    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
+            histogram[i] = 0;
+        }
+        __syncthreads();
+
+        const uint32_t hi_mask   = shift + RADIX_BITS >= 32 ? 0u : 0xFFFFFFFFu << (shift + RADIX_BITS);
+        const uint32_t prefix_hi = prefix & hi_mask;
+
+        for (int i = tid; i < n_kv; i += BLOCK_SIZE) {
+            const int block = row_cell[i];
+            const float v = row_scores[(size_t) block * n_tps + t] + __half2float(row_mask[i]);
+            const uint32_t key = topk_qsa_float_to_ordered(v);
+            if ((key & hi_mask) == prefix_hi) {
+                atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            int acc = 0;
+            int bin = 0;
+            for (int b = NBINS - 1; b >= 0; --b) {
+                const int count = histogram[b];
+                if (acc + count >= desired) {
+                    bin = b;
+                    break;
+                }
+                acc += count;
+            }
+            s_bucket = bin;
+            s_above  = acc;
+        }
+        __syncthreads();
+
+        prefix |= (uint32_t) s_bucket << shift;
+        desired -= s_above;
+        __syncthreads();
+    }
+
+    const uint32_t threshold = prefix;
+
+    if (tid == 0) {
+        out_count = 0;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < n_kv; i += BLOCK_SIZE) {
+        const int block = row_cell[i];
+        const float v = row_scores[(size_t) block * n_tps + t] + __half2float(row_mask[i]);
+        if (topk_qsa_float_to_ordered(v) > threshold) {
+            const int pos = atomicAdd(&out_count, 1);
+            if (pos < width) {
+                row_out[pos] = i;
+            }
+        }
+    }
+    __syncthreads();
+
+    // ties fill the remaining slots; all strictly-greater cells are already placed
+    for (int i = tid; i < n_kv; i += BLOCK_SIZE) {
+        const int block = row_cell[i];
+        const float v = row_scores[(size_t) block * n_tps + t] + __half2float(row_mask[i]);
+        if (topk_qsa_float_to_ordered(v) == threshold) {
+            const int pos = atomicAdd(&out_count, 1);
+            if (pos < width) {
+                row_out[pos] = i;
+            }
+        }
+    }
+}
+
+void ggml_cuda_op_topk_qsa(ggml_backend_cuda_context & ctx, const ggml_tensor * scores, const ggml_tensor * cell_blk,
+                           const ggml_tensor * mask, ggml_tensor * top_k) {
+    GGML_ASSERT(scores->type == GGML_TYPE_F32 && ggml_is_contiguous(scores));
+    GGML_ASSERT(cell_blk->type == GGML_TYPE_I32 && ggml_is_contiguous(cell_blk));
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask));
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && ggml_is_contiguous(top_k));
+
+    const int n_tps    = scores->ne[0];
+    const int n_blocks = scores->ne[1];
+    const int n_stream = scores->ne[2];
+    const int n_kv     = cell_blk->ne[0];
+    const int width    = top_k->ne[0];
+    const int nrows    = n_tps * n_stream;
+
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int RADIX_BITS = 8;
+
+    topk_qsa_kernel<BLOCK_SIZE, RADIX_BITS><<<nrows, BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) scores->data, (const int32_t *) cell_blk->data, (const ggml_half *) mask->data,
+        (int32_t *) top_k->data, n_kv, width, n_tps, n_blocks, n_stream);
+}

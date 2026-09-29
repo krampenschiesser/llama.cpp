@@ -4235,6 +4235,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (node->op == GGML_OP_GET_ROWS) {
+        ggml_cuda_topk_qsa_match qsa_match;
+        if (ggml_cuda_match_topk_qsa(cgraph, i, qsa_match)) {
+            const int output_idx = i + 6;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 7, &output_idx, 1)) {
+                ggml_cuda_op_topk_qsa(*cuda_ctx, qsa_match.scores, qsa_match.cell_blk, qsa_match.mask, qsa_match.top_k);
+                return 6;
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -4652,6 +4663,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 params->add_alloc_dep(params->user_data,
                         const_cast<ggml_tensor *>(cgraph->nodes[i]->src[0]), cgraph->nodes[i + 3]);
                 i += 3;
+            }
+
+            if (cgraph->nodes[i]->op == GGML_OP_GET_ROWS) {
+                ggml_cuda_topk_qsa_match qsa_match;
+                if (ggml_cuda_match_topk_qsa(cgraph, i, qsa_match)) {
+                    // the fused kernel reads these at the get_rows position; keep them alive until top_k
+                    ggml_tensor * until = cgraph->nodes[i + 6];
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa_match.scores), until);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa_match.cell_blk), until);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(qsa_match.mask), until);
+                    i += 6;
+                }
             }
         }
     }
