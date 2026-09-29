@@ -103,7 +103,8 @@ struct llm_graph_params;
 // gathers rows from a resident or lazy table
 class llm_graph_lazy_rows {
 public:
-    ggml_tensor * build(ggml_context * ctx0, ggml_tensor * table, const llama_lazy_reader * reader, int64_t n_rows);
+    ggml_tensor * build(ggml_context * ctx0, ggml_tensor * table, const llama_lazy_reader * reader, int64_t n_rows,
+                        ggml_backend_sched_t sched, ggml_backend_t backend_cpu);
 
     void set_rows(const int32_t * idx, int64_t n);
 

@@ -68,7 +68,8 @@ static bool can_reuse_kq_mask(
 // impl
 
 ggml_tensor * llm_graph_lazy_rows::build(ggml_context * ctx0, ggml_tensor * table,
-                                         const llama_lazy_reader * reader, int64_t n_rows) {
+                                         const llama_lazy_reader * reader, int64_t n_rows,
+                                         ggml_backend_sched_t sched, ggml_backend_t backend_cpu) {
     this->table = table;
     this->reader = reader;
 
@@ -88,7 +89,14 @@ ggml_tensor * llm_graph_lazy_rows::build(ggml_context * ctx0, ggml_tensor * tabl
         identity[i] = (int32_t) i;
     }
 
-    return ggml_get_rows(ctx0, t, t_indices);
+    ggml_tensor * res = ggml_get_rows(ctx0, t, t_indices);
+
+    // the lazy table is host-resident, so keep the gather on the CPU to avoid host views in tensor-split graphs
+    ggml_backend_sched_set_tensor_backend(sched, t,         backend_cpu);
+    ggml_backend_sched_set_tensor_backend(sched, t_indices, backend_cpu);
+    ggml_backend_sched_set_tensor_backend(sched, res,       backend_cpu);
+
+    return res;
 }
 
 void llm_graph_lazy_rows::set_rows(const int32_t * idx, int64_t n) {
