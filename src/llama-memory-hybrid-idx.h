@@ -2,7 +2,10 @@
 
 #include "llama-memory-hybrid.h"
 
+#include <cstdint>
+#include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 
 //
@@ -100,6 +103,69 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    // one grouping per (ratio, stream), kept across ubatches so a pure append only updates the new cells
+    // set_input_qsa is const and the context is per-batch, so the cache lives here
+    struct qsa_stream_cache {
+        uint64_t epoch = 0;
+        bool     ok    = false;
+
+        uint32_t ratio    = 0;
+        int64_t  n_kv     = 0;
+        int64_t  n_blocks = 0;
+        int64_t  n_tps    = 0;
+
+        // tensors the last pass filled, so an append only patches buffers it built
+        const void * p_cell_blk  = nullptr;
+        const void * p_blk_cells = nullptr;
+        const void * p_blk_pos   = nullptr;
+        const void * p_bias      = nullptr;
+
+        // cells snapshot after the ubatch that built this cache
+        uint64_t  n_used      = 0;
+        uint64_t  used_max_p1 = 0;
+        llama_pos seq_pos_max = -1;
+
+        // grouping state, mirrors the locals of the full rebuild
+        std::vector<int32_t>  blk_of;       // [n_kv]
+        std::vector<int32_t>  grp_head;     // [n_blocks]
+        std::vector<int32_t>  grp_next;
+        std::vector<int32_t>  grp_first;
+        std::vector<int32_t>  grp_slot0;
+        std::vector<uint64_t> grp_slots;
+        std::vector<int32_t>  grp_bid;
+        std::vector<int32_t>  grp_cells;    // [n_groups * ratio], slot -> cell
+
+        std::vector<int32_t>  bid_idx;
+        std::vector<int32_t>  bid_cell;
+        std::vector<int32_t>  bid_slot0;
+
+        int32_t n_bid     = 0;
+        int32_t dead_bid  = 0;
+        bool    have_dead = false;
+    };
+
+    // keyed on (ratio, cells) because only the cell array names a stream
+    mutable std::map<std::pair<uint32_t, uintptr_t>, qsa_stream_cache> qsa_cache;
+    mutable uint64_t qsa_mut_epoch = 0;
+
+    // returns true and fills the four outputs when the new cell range is a pure append of the cached grouping
+    bool set_input_qsa_incremental(
+            const llama_kv_cells & cells,
+            const llama_ubatch   * ubatch,
+                       uint32_t    ratio,
+                           bool    blk_bias,
+                           bool    causal_attn,
+                         int64_t   n_kv,
+                         int64_t   n_blocks,
+                         int64_t   n_ns,
+                         int64_t   n_tps,
+                       uint32_t    s,
+                           bool    one_seq,
+                        int32_t  * dst_cell_blk,
+                        int32_t  * dst_blk_cells,
+                        int32_t  * dst_blk_pos,
+                          float  * dst_bias) const;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
