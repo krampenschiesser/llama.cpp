@@ -335,6 +335,9 @@ extern "C" {
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
+        // max GPUs a single tensor may be split across in LLAMA_SPLIT_MODE_TENSOR; 0 = all
+        uint32_t max_tensor_split;
+
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
         // If it returns false, model loading is immediately aborted.
