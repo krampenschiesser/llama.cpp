@@ -1479,6 +1479,11 @@ static void * ggml_backend_meta_staging(ggml_backend_buffer_t buffer, size_t nee
     if (nb == nullptr) {
         return nullptr;
     }
+    if (ggml_backend_buffer_get_type(nb) != host_buft) {
+        // allocation silently fell back to pageable memory, staging would not help
+        ggml_backend_buffer_free(nb);
+        return nullptr;
+    }
     buf = nb;
     ptr = ggml_backend_buffer_get_base(nb);
     cap = new_cap;
