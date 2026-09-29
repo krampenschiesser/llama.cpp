@@ -351,7 +351,7 @@ static bool parse_bool_value(const std::string & value) {
 static std::string get_default_local_path(const std::string & url) {
     auto f = string_split<std::string>(url, '#').front();
     f = string_split<std::string>(f, '?').front();
-    return fs_get_cache_file(string_split<std::string>(f, '/').back());
+    return fs_path_to_utf8(fs_get_cache_file(string_split<std::string>(f, '/').back()));
 }
 
 static bool spec_types_is_default(const common_params & params) {
@@ -2706,9 +2706,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
-        "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
-        "- auto: on, but only for tensors larger than 4 GiB\n"
-        "- off: always keep them resident",
+        "- on: read the rows of such tensors from disk on demand instead of keeping them resident\n"
+        "- auto: on only for tensors larger than 4 GiB\n"
+        "- off: always keep them resident\n"
+        "note: --check-tensors and --load-mode mmap+mlock force this option to 'off'",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
             else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }

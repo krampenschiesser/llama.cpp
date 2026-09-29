@@ -17,6 +17,7 @@
 
 struct llama_cparams;
 struct llama_ubatch;
+struct llama_lazy_reader_factory;
 struct llama_model_loader;
 struct llama_model;
 
@@ -739,6 +740,8 @@ struct llama_model {
     std::deque<llama_meta_device_get_split_state_userdata> get_split_state_uds;
     size_t n_tensor_split_groups = 0;
 
+    std::unique_ptr<llama_lazy_reader_factory> lazy_reader_factory;
+
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
@@ -849,6 +852,8 @@ struct llama_model_base : public llama_model {
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;
     void load_arch_tensors(llama_model_loader & ml) override = 0;
+
+    void add_lazy_reader(llama_model_loader & ml, const ggml_tensor * t);
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override = 0;
 };
 
