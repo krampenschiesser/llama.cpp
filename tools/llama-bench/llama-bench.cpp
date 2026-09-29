@@ -360,6 +360,7 @@ struct cmd_params {
     std::vector<llama_flash_attn_type> flash_attn;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
+    std::vector<int>                 max_tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
@@ -406,6 +407,7 @@ static const cmd_params cmd_params_defaults = {
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
+    /* max_tensor_split     */ { 0 },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
@@ -481,6 +483,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
+    printf("  --max-tensor-split <n>                            (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
     printf("                                                    (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
@@ -938,6 +941,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     }
                     params.tensor_split.push_back(tensor_split);
                 }
+            } else if (arg == "--max-tensor-split") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<int>(argv[i], split_delim);
+                params.max_tensor_split.insert(params.max_tensor_split.end(), p.begin(), p.end());
             } else if (arg == "-ot" || arg == "--override-tensor") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1171,6 +1181,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.tensor_split.empty()) {
         params.tensor_split = cmd_params_defaults.tensor_split;
     }
+    if (params.max_tensor_split.empty()) {
+        params.max_tensor_split = cmd_params_defaults.max_tensor_split;
+    }
     if (params.tensor_buft_overrides.empty()) {
         params.tensor_buft_overrides = cmd_params_defaults.tensor_buft_overrides;
     }
@@ -1231,6 +1244,7 @@ struct cmd_params_instance {
     llama_flash_attn_type flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
+    int                max_tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool               embeddings;
     bool               no_op_offload;
@@ -1251,6 +1265,7 @@ struct cmd_params_instance {
         mparams.lazy_mode     = lazy_mode;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
+        mparams.max_tensor_split = max_tensor_split;
         mparams.no_host       = no_host;
         mparams.use_extra_bufts = repack;
 
@@ -1297,6 +1312,7 @@ struct cmd_params_instance {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
+               max_tensor_split == other.max_tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
                devices == other.devices && no_host == other.no_host && repack == other.repack &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
@@ -1336,6 +1352,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
     for (const auto & ts : params.tensor_split)
+    for (const auto & mts : params.max_tensor_split)
     for (const auto & ot : params.tensor_buft_overrides)
     for (const auto & noh : params.no_host)
     for (const auto & rpk : params.repack)
@@ -1379,6 +1396,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
+                /* .max_tensor_split      = */ mts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
@@ -1417,6 +1435,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
+                /* .max_tensor_split      = */ mts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
@@ -1455,6 +1474,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
+                /* .max_tensor_split      = */ mts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
@@ -1498,6 +1518,7 @@ struct test {
     llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
+    int                      max_tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool                     embeddings;
     bool                     no_op_offload;
@@ -1539,6 +1560,7 @@ struct test {
         flash_attn     = inst.flash_attn;
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
+        max_tensor_split = inst.max_tensor_split;
         tensor_buft_overrides = inst.tensor_buft_overrides;
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
@@ -1602,6 +1624,7 @@ struct test {
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "max_tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
             "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
@@ -1618,7 +1641,7 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "max_tensor_split") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1696,6 +1719,7 @@ struct test {
                                             std::to_string((int) flash_attn),
                                             devices_to_string(devices),
                                             tensor_split_str,
+                                            std::to_string(max_tensor_split),
                                             tensor_buft_overrides_str,
                                             llama_load_mode_name(load_mode),
                                             lazy_mode_str(lazy_mode),
@@ -1945,6 +1969,9 @@ struct markdown_printer : public printer {
         if (field == "tensor_split") {
             return "ts";
         }
+        if (field == "max_tensor_split") {
+            return "mts";
+        }
         if (field == "tensor_buft_overrides") {
             return "ot";
         }
@@ -2013,6 +2040,9 @@ struct markdown_printer : public printer {
         }
         if (params.tensor_split.size() > 1 || params.tensor_split != cmd_params_defaults.tensor_split) {
             fields.emplace_back("tensor_split");
+        }
+        if (params.max_tensor_split.size() > 1 || params.max_tensor_split != cmd_params_defaults.max_tensor_split) {
+            fields.emplace_back("max_tensor_split");
         }
         if (params.tensor_buft_overrides.size() > 1 || !vec_vec_tensor_buft_override_equal(params.tensor_buft_overrides, cmd_params_defaults.tensor_buft_overrides)) {
             fields.emplace_back("tensor_buft_overrides");
