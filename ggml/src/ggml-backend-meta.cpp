@@ -13,8 +13,10 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -1419,10 +1421,114 @@ static void ggml_backend_meta_buffer_memset_tensor(
     }
 }
 
+// Returns a reusable pinned host staging buffer of at least `need` bytes for `buffer`'s
+// device, or nullptr if pinned memory is unavailable. Staging a split tensor through pinned
+// memory avoids the very slow pageable cudaMemcpy2D path (many short strided rows).
+static void * ggml_backend_meta_staging(ggml_backend_buffer_t buffer, size_t need) {
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+
+    static ggml_backend_buffer_t buf = nullptr;
+    static ggml_backend_dev_t    dev = nullptr;
+    static void *                ptr = nullptr;
+    static size_t                cap = 0;
+
+    ggml_backend_dev_t cur = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
+    if (cur == nullptr) {
+        return nullptr;
+    }
+    if (ptr != nullptr && cap >= need && cur == dev) {
+        return ptr;
+    }
+    // Grow geometrically to avoid repeated (expensive) pin/unpin on every larger tensor.
+    size_t new_cap = need;
+    if (cur == dev && cap > 0 && cap < need) {
+        new_cap = std::max(need, cap * 2);
+    }
+    if (buf != nullptr) {
+        ggml_backend_buffer_free(buf);
+        buf = nullptr; ptr = nullptr; cap = 0; dev = nullptr;
+    }
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(cur);
+    if (host_buft == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t nb = ggml_backend_buft_alloc_buffer(host_buft, new_cap);
+    if (nb == nullptr) {
+        return nullptr;
+    }
+    buf = nb;
+    ptr = ggml_backend_buffer_get_base(nb);
+    cap = new_cap;
+    dev = cur;
+    return ptr;
+}
+
+template <typename F>
+static void ggml_backend_meta_parallel(size_t n, F && fn) {
+    if (n <= 1) {
+        for (size_t i = 0; i < n; ++i) {
+            fn(i);
+        }
+        return;
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        threads.emplace_back([&fn, i]() { fn(i); });
+    }
+    for (auto & t : threads) {
+        t.join();
+    }
+}
+
+static void ggml_backend_meta_staging_memcpy(void * dst, const void * src, size_t size) {
+    constexpr size_t chunk = 16u << 20;
+    if (size < chunk) {
+        memcpy(dst, src, size);
+        return;
+    }
+    const size_t n = (size + chunk - 1) / chunk;
+    std::vector<std::thread> threads;
+    threads.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const size_t off = i * chunk;
+        const size_t len = std::min(chunk, size - off);
+        threads.emplace_back([dst, src, off, len]() {
+            memcpy((char *) dst + off, (const char *) src + off, len);
+        });
+    }
+    for (auto & t : threads) {
+        t.join();
+    }
+}
+
+// A 2D split copy degrades badly when it has many short rows, because the driver stages each
+// row separately. One row is contiguous, so only multi-row (strided) copies are affected.
+// Above this many rows, staging through pinned memory is a clear win (measured empirically).
+static constexpr size_t GGML_BACKEND_META_STRIDED_ROW_THRESHOLD = 1024;
+
+static bool ggml_backend_meta_set_tensor_is_strided(const ggml_tensor * tensor, size_t size, const ggml_backend_meta_split_state & split_state) {
+    if (split_state.axis > GGML_BACKEND_SPLIT_AXIS_2) {
+        return false;
+    }
+    return size / tensor->nb[split_state.axis + 1] >= GGML_BACKEND_META_STRIDED_ROW_THRESHOLD;
+}
+
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+    // Strided host->device copies run ~20x slower from pageable memory (the CUDA driver stages
+    // each short row separately). Stage the range through pinned memory once, then run the
+    // existing split logic against it.
+    if (size >= (1u << 20) && ggml_backend_meta_set_tensor_is_strided(tensor, size, split_state)) {
+        if (void * staging = ggml_backend_meta_staging(buffer, size)) {
+            ggml_backend_meta_staging_memcpy(staging, data, size);
+            data = (const void *) staging;
+        }
+    }
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
@@ -1495,6 +1601,12 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        /chunk_size_full;
             const int64_t i_stop  = (offset + size)/chunk_size_full;
+            const int64_t n_copies = i_stop - i_start;
+
+            std::vector<ggml_tensor *> simple_tensors;
+            std::vector<size_t>        simple_offsets;
+            std::vector<size_t>        data_offsets;
+            std::vector<size_t>        widths;
             size_t offset_j = 0;
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
@@ -1502,11 +1614,27 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                const size_t simple_offset = i_start * chunk_size_j;
-                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                simple_tensors.push_back(simple_tensor);
+                simple_offsets.push_back(i_start * chunk_size_j);
+                data_offsets.push_back(offset_j);
+                widths.push_back(chunk_size_j);
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
+
+            const size_t n_tasks = simple_tensors.size();
+            const bool parallel = size >= (16u << 20) && n_tasks > 1;
+            auto copy = [&](size_t t) {
+                ggml_backend_tensor_set_2d(simple_tensors[t], (const char *) data + data_offsets[t], simple_offsets[t],
+                    widths[t], n_copies, widths[t], chunk_size_full);
+            };
+            if (parallel) {
+                ggml_backend_meta_parallel(n_tasks, copy);
+            } else {
+                for (size_t t = 0; t < n_tasks; ++t) {
+                    copy(t);
+                }
+            }
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_bufs; j++) {
