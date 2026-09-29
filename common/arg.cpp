@@ -2852,6 +2852,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
     add_opt(common_arg(
+        {"--max-tensor-split"}, "N",
+        string_format("maximum number of GPUs across which a single tensor may be split in tensor split mode, 0 = all (default: %d)", params.max_tensor_split),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("max-tensor-split must be >= 0");
+            }
+            if (value > GGML_BACKEND_META_MAX_DEVICES) {
+                throw std::invalid_argument(
+                    string_format("max-tensor-split must be <= %d", GGML_BACKEND_META_MAX_DEVICES)
+                );
+            }
+            params.max_tensor_split = value;
+        }
+    ).set_env("LLAMA_ARG_MAX_TENSOR_SPLIT"));
+    add_opt(common_arg(
         {"-mg", "--main-gpu"}, "INDEX",
         string_format("the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu),
         [](common_params & params, int value) {

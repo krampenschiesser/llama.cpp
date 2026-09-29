@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -601,10 +602,15 @@ struct llama_device {
     bool is_meta;
 
     ggml_backend_dev_t dev;
+
+    // index range of this device inside the physical selected-device list
+    size_t first_simple = 0;
+    size_t n_simple     = 1;
 };
 
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
+    size_t                     first_device;
     const struct llama_model * model;
 };
 
@@ -729,8 +735,9 @@ struct llama_model {
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
-    // statically allocated context for assigning
-    struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+    // stable per-group split-state userdata; deque so pointers stay valid when groups are appended
+    std::deque<llama_meta_device_get_split_state_userdata> get_split_state_uds;
+    size_t n_tensor_split_groups = 0;
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;

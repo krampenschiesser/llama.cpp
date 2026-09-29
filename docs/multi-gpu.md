@@ -92,6 +92,18 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
   - **State-space / RWKV-style:** Mamba, Mamba2 (and the hybrid Mamba-attention models above)
   - **Other:** PLAMO2, MiniCPM3, Gemma-3n, OLMo2, BitNet, T5
 
+#### Capping tensor parallelism: `--max-tensor-split N`
+
+By default `tensor` splits every layer across all selected GPUs. On a large PCIe system the resulting allreduce can dominate, so `--max-tensor-split N` caps how many GPUs a single tensor may be split across.
+
+- Selected GPUs are grouped into consecutive chunks of at most `N`, in `--device` order. The last group may be smaller. Layers are distributed across the groups, so every GPU still holds work.
+- Example: 10 GPUs with `--max-tensor-split 2` gives 5 groups of 2, i.e. TP=2 and PP=5.
+- `N == 0`, or `N` greater than or equal to the number of selected GPUs, means one group over all GPUs. This is the default and reproduces the current behavior.
+- `--tensor-split` stays indexed by physical GPU. Within a group it sets the TP proportions, and a group's layer share is the sum of its members' weights (falling back to free memory when the entries are unset or zero).
+- `--max-tensor-split 1` disables tensor parallelism altogether (TP degree 1) and is not recommended.
+- Pipeline parallelism is not enabled: layers on different groups run sequentially, and boundary activations are copied through host memory. The win is smaller collectives, not overlap.
+- `--fit` is not supported with `--split-mode tensor`, with or without this flag.
+
 ### 5. With NCCL
 
 There's no runtime flag for NCCL - it's selected at build time (`-DGGML_CUDA_NCCL=ON`, this is the default). Note that NCCL is **not** automatically distributed with CUDA and you may need to install it manually - when in doubt check the CMake log to see whether or not it can find the package. When llama.cpp is compiled with NCCL support it uses it automatically for cross-GPU reductions in `tensor` mode. When NCCL is missing on a multi-GPU build, you'll see this one-time warning and performance will be lower:

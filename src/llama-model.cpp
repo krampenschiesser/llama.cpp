@@ -374,6 +374,8 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
+    GGML_ASSERT(ud->n_devices <= GGML_BACKEND_META_MAX_DEVICES);
+    GGML_ASSERT(ud->first_device + ud->n_devices <= llama_max_devices());
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
@@ -834,7 +836,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[ud->first_device + (j + tc.rotation) % ud->n_devices]);
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
@@ -1550,7 +1552,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // calculate the split points
-    bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
+    // devices are meta groups in tensor split mode; weight each group by the sum of its members
+    size_t n_phys_devices = 0;
+    for (const auto & dev : devices) {
+        n_phys_devices += dev.n_simple;
+    }
+    const bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_phys_devices, [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
     if (all_zero) {
         // default split, by free memory
@@ -1569,7 +1576,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             splits[i] = free;
         }
     } else {
-        std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
+        for (size_t i = 0; i < n_devices(); ++i) {
+            float split = 0.0f;
+            for (size_t k = 0; k < devices[i].n_simple; ++k) {
+                split += tensor_split[devices[i].first_simple + k];
+            }
+            splits[i] = split;
+        }
     }
 
     // sum and normalize the splits to get the split points
@@ -1608,6 +1621,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+    if (split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        std::unordered_set<ggml_backend_dev_t> used_devs;
+        for (const auto & d : pimpl->dev_layer) {
+            if (d.dev != cpu_dev) {
+                used_devs.insert(d.dev);
+            }
+        }
+        if (pimpl->dev_output.dev != cpu_dev) {
+            used_devs.insert(pimpl->dev_output.dev);
+        }
+        if (used_devs.size() < n_tensor_split_groups) {
+            LLAMA_LOG_WARN("%s: %zu of %zu tensor split group(s) receive no layers (check n_gpu_layers and --tensor-split); their device memory is still reserved\n",
+                    __func__, n_tensor_split_groups - used_devs.size(), n_tensor_split_groups);
+        }
+    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -2861,6 +2890,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.max_tensor_split            =*/ 0,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
