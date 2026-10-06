@@ -1956,7 +1956,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->lazy_ctxs.insert(ctx);
         }
 
-        if (ml.use_mmap && !ctx_key.lazy && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1979,7 +1981,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc || ctx_key.lazy) {
+            if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them

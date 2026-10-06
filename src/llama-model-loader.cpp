@@ -1407,7 +1407,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
-    if (use_mmap) {
+    if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {
@@ -1634,12 +1634,7 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        if (lazy.has(cur)) {
-            size_done += n_size;
-            continue;
-        }
-
-        const bool from_mapping = use_mmap;
+        const bool from_mapping = use_mmap || lazy.has(cur);
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1659,7 +1654,7 @@ bool llama_model_loader::load_all_data(
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
 
-                if (lmlocks) {
+                if (lmlocks && !lazy.has(cur)) {
                     const auto & lmlock = lmlocks->at(weight->idx);
                     lmlock->grow_to(weight->offs + n_size);
                 }

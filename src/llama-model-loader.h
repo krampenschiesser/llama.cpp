@@ -98,6 +98,8 @@ struct llama_model_loader {
             return tensors.count(ggml_get_name(t)) > 0;
         }
 
+        bool any() const { return !ranges.empty(); }
+
         const llama_mmap::ranges & for_file(uint32_t idx) const {
             static const llama_mmap::ranges none;
 
