@@ -10044,17 +10044,52 @@ static void ggml_compute_forward_ssm_conv_f32(
 
             // TODO: transpose the output for smaller strides for big batches?
             // d_inner
-            for (int i1 = 0; i1 < ir; ++i1) {
-                // rowwise dot product
-                // NOTE: not using ggml_vec_dot_f32, because its sum is in double precision
-                float sumf = 0.0f;
-
-                // d_conv
-                for (int i0 = 0; i0 < nc; ++i0) {
-                    sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+            // ggml_vec_dot_f32 sums in float on SIMD builds; only the scalar fallback sums in double
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE)
+            if (nc >= GGML_F32_STEP) {
+                for (int i1 = 0; i1 < ir; ++i1) {
+                    // rowwise dot product
+                    ggml_vec_dot_f32(nc, &x[i1], 0, s + i1*ncs, 0, c + i1*nc, 0, 1);
                 }
-                x[i1] = sumf;
+            } else {
+                int i1 = 0;
+                for (; i1 + 4 <= ir; i1 += 4) {
+                    float sumf0 = 0.0f;
+                    float sumf1 = 0.0f;
+                    float sumf2 = 0.0f;
+                    float sumf3 = 0.0f;
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        sumf0 += s[i0 + (i1 + 0)*ncs] * c[i0 + (i1 + 0)*nc];
+                        sumf1 += s[i0 + (i1 + 1)*ncs] * c[i0 + (i1 + 1)*nc];
+                        sumf2 += s[i0 + (i1 + 2)*ncs] * c[i0 + (i1 + 2)*nc];
+                        sumf3 += s[i0 + (i1 + 3)*ncs] * c[i0 + (i1 + 3)*nc];
+                    }
+                    x[i1 + 0] = sumf0;
+                    x[i1 + 1] = sumf1;
+                    x[i1 + 2] = sumf2;
+                    x[i1 + 3] = sumf3;
+                }
+                for (; i1 < ir; ++i1) {
+                    float sumf = 0.0f;
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+                    }
+                    x[i1] = sumf;
+                }
             }
+#else
+            {
+                for (int i1 = 0; i1 < ir; ++i1) {
+                    float sumf = 0.0f;
+
+                    // d_conv
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+                    }
+                    x[i1] = sumf;
+                }
+            }
+#endif
         }
     }
 }
