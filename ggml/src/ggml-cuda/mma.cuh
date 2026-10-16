@@ -952,7 +952,7 @@ namespace ggml_cuda_mma {
         static_assert(I == 8 || I == 16, "bad tile width");
         static_assert(J ==  8, "bad tile height");
         const int i = threadIdx.x % t.I;
-        const int j = (threadIdx.x / t.I) * (t.J / 2);
+        const int j = ((threadIdx.x / t.I) * (t.J / 2)) % t.J;
         int offset_ij = offset + i * stride + j;
         offset_ij = swizzle<stride, T>(offset_ij, i);
         int * xi = (int *) t.x;
@@ -1019,19 +1019,16 @@ namespace ggml_cuda_mma {
 #if defined(TURING_MMA_AVAILABLE)
         static_assert(I == 8 || I == 16, "bad tile width");
         static_assert(dl == DATA_LAYOUT_I_MAJOR, "bad data layout");
+        const int i = threadIdx.x % 16;
+        const int j = I == 16 ? (threadIdx.x / 16) * (t.J / 2) : 0;
+        int offset_ij = offset + i * stride + j;
+        offset_ij = swizzle<stride, T>(offset_ij, i);
         int * xi = (int *) t.x;
         if constexpr (I == 16) {
-            const int i = threadIdx.x % t.I;
-            const int j = (threadIdx.x / t.I) * (t.J / 2);
-            int offset_ij = offset + i * stride + j;
-            offset_ij = swizzle<stride, T>(offset_ij, i);
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
                 : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
                 : "l"(xs0 + offset_ij));
         } else {
-            const int i = threadIdx.x % 16;
-            int offset_ij = offset + i * stride;
-            offset_ij = swizzle<stride, T>(offset_ij, i);
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0, %1}, [%2];"
                 : "=r"(xi[0]), "=r"(xi[1])
                 : "l"(xs0 + offset_ij));
