@@ -512,6 +512,7 @@ if (GGML_CPU_ALL_VARIANTS)
             # https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64?view=msvc-170
             ggml_add_cpu_backend_variant(cooperlake     SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VNNI AVX512_BF16)
             ggml_add_cpu_backend_variant(zen4           SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16)
+            ggml_add_cpu_backend_variant(epyc9005       SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512F AVX512DQ AVX512IFMA AVX512CD AVX512BW AVX512VL AVX512_VBMI AVX512_VBMI2 AVX512_VNNI AVX512_BF16)
         endif()
         ggml_add_cpu_backend_variant(alderlake          SSE42 AVX F16C FMA AVX2 BMI2 AVX_VNNI)
         if (NOT MSVC)
