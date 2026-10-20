@@ -1314,6 +1314,9 @@ class GGUFWriter:
     def add_add_sep_token(self, value: bool) -> None:
         self.add_bool(Keys.Tokenizer.ADD_SEP, value)
 
+    def add_dna_auto_tags(self, value: bool) -> None:
+        self.add_bool(Keys.Tokenizer.DNA_AUTO_TAGS, value)
+
     def add_add_space_prefix(self, value: bool) -> None:
         self.add_bool(Keys.Tokenizer.ADD_PREFIX, value)
 
@@ -1466,6 +1469,12 @@ class GGUFWriter:
 
     def add_vision_preproc_image_size(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.PREPROC_IMAGE_SIZE, value)
+
+    def add_vision_preproc_tile_size(self, value: int) -> None:
+        self.add_uint32(Keys.ClipVision.PREPROC_TILE_SIZE, value)
+
+    def add_vision_preproc_max_pixels_tolerance(self, value: float) -> None:
+        self.add_float32(Keys.ClipVision.PREPROC_MAX_PIXELS_TOLERANCE, value)
 
     def add_vision_projector_query_side(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.Projector.QUERY_SIDE, value)

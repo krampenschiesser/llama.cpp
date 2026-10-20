@@ -145,7 +145,8 @@ static __global__ void dsv4_hc_pre_f32(
     dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
-template <bool has_comb>
+// gated: post = gate_scale_out*sigmoid(gate_scale_in*post), the fused SCALE -> SIGMOID -> SCALE chain of qwen4exp
+template <bool has_comb, bool gated>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
         const float * residual,
@@ -167,7 +168,9 @@ static __global__ void dsv4_hc_post_f32(
         int64_t sc2,
         int64_t sd0,
         int64_t sd1,
-        int64_t sd2) {
+        int64_t sd2,
+        float gate_scale_in,
+        float gate_scale_out) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * hc * n_tokens;
@@ -182,7 +185,12 @@ static __global__ void dsv4_hc_post_f32(
     const int64_t idst = (ir / n_embd) % hc;
     const int64_t it   = ir / (n_embd * hc);
 
-    float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
+    float p = post[idst*sp0 + it*sp1];
+    if constexpr (gated) {
+        p = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * p))));
+    }
+
+    float sum = x[i0*sx0 + it*sx1] * p;
     if constexpr (has_comb) {
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
             sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
@@ -192,76 +200,6 @@ static __global__ void dsv4_hc_post_f32(
     }
 
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
-}
-
-// fused scale + sigmoid + scale + dsv4_hc_post. `gate` is the raw pre-activation, and
-// gate_scale_out*sigmoid(gate_scale_in*gate) is evaluated once per (idst, it) into shared memory.
-template <bool has_comb>
-static __global__ void dsv4_hc_post_gated_f32(
-        const float * x,
-        const float * residual,
-        const float * gate,
-        const float * comb,
-        float * dst,
-        int64_t n_embd,
-        int64_t hc,
-        int64_t n_tokens,
-        int64_t sx0,
-        int64_t sx1,
-        int64_t sr0,
-        int64_t sr1,
-        int64_t sr2,
-        int64_t sg0,
-        int64_t sg1,
-        int64_t sc0,
-        int64_t sc1,
-        int64_t sc2,
-        int64_t sd0,
-        int64_t sd1,
-        int64_t sd2,
-        float   gate_scale_in,
-        float   gate_scale_out) {
-    extern __shared__ float sh[];
-    float * gate_sh = sh;
-    float * comb_sh = sh + hc;
-
-    ggml_cuda_pdl_lc();
-    ggml_cuda_pdl_sync();
-
-    const int64_t tid    = threadIdx.x;
-    const int64_t n_tile = (n_embd + blockDim.x - 1) / blockDim.x;
-    const int64_t it     = blockIdx.x / n_tile;
-    const int64_t tile   = blockIdx.x % n_tile;
-
-    for (int64_t h = tid; h < hc; h += blockDim.x) {
-        gate_sh[h] = gate_scale_out / (1.0f + expf(-(gate_scale_in * gate[h*sg0 + it*sg1])));
-    }
-    if constexpr (has_comb) {
-        for (int64_t i = tid; i < hc*hc; i += blockDim.x) {
-            comb_sh[i] = comb[(i % hc)*sc0 + (i / hc)*sc1 + it*sc2];
-        }
-    }
-    __syncthreads();
-
-    const int64_t i0 = tile * (int64_t) blockDim.x + tid;
-    if (i0 >= n_embd) {
-        return;
-    }
-
-    const float   xv     = x[i0*sx0 + it*sx1];
-    const float * res_it = residual + i0*sr0 + it*sr2;
-
-    for (int64_t idst = 0; idst < hc; ++idst) {
-        float sum = xv * gate_sh[idst];
-        if constexpr (has_comb) {
-            for (int64_t isrc = 0; isrc < hc; ++isrc) {
-                sum += res_it[isrc*sr1] * comb_sh[idst + hc*isrc];
-            }
-        } else {
-            sum += res_it[idst*sr1];
-        }
-        dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
-    }
 }
 
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -342,16 +280,18 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             scale);
 }
 
-static void ggml_cuda_op_dsv4_hc_post_impl(
-        ggml_backend_cuda_context & ctx,
-        ggml_tensor *               dst,
-        const ggml_tensor *         post,
-        const bool                  gated,
-        const float                 gate_scale_in,
-        const float                 gate_scale_out) {
+void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
     const ggml_tensor * comb     = dst->src[3];
+
+    // when fused, read the raw post weights from before the SCALE -> SIGMOID -> SCALE chain
+    const bool          gated = gate_scale_in != nullptr;
+    const ggml_tensor * post  = gated ? gate_scale_in->src[0] : dst->src[2];
+
+    const float gate_in  = gated ? ggml_get_op_params_f32(gate_scale_in,  0) : 1.0f;
+    const float gate_out = gated ? ggml_get_op_params_f32(gate_scale_out, 0) : 1.0f;
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
@@ -373,34 +313,13 @@ static void ggml_cuda_op_dsv4_hc_post_impl(
     const int64_t hc       = residual->ne[1];
 
     const int block_size = 256;
-
-    if (gated) {
-        const int64_t n_tile = (n_embd + block_size - 1) / block_size;
-        const dim3 block_dims(block_size, 1, 1);
-        const dim3 grid_dims(n_tile * n_tokens, 1, 1);
-        const size_t shmem = (hc + hc*hc) * sizeof(float);
-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, shmem, ctx.stream());
-
-        const auto kernel = comb ? dsv4_hc_post_gated_f32<true> : dsv4_hc_post_gated_f32<false>;
-        ggml_cuda_kernel_launch(kernel, launch_params,
-                (const float *) x->data, (const float *) residual->data,
-                (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
-                n_embd, hc, n_tokens,
-                nbx0 / sizeof(float), nbx1 / sizeof(float),
-                nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
-                nbp0 / sizeof(float), nbp1 / sizeof(float),
-                nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
-                nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
-                gate_scale_in, gate_scale_out);
-        return;
-    }
-
     const int64_t nr = n_embd * hc * n_tokens;
     const dim3 block_dims(block_size, 1, 1);
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    const auto kernel = comb ? dsv4_hc_post_f32<true> : dsv4_hc_post_f32<false>;
+    auto kernel = comb ? (gated ? dsv4_hc_post_f32<true,  true> : dsv4_hc_post_f32<true,  false>)
+                       : (gated ? dsv4_hc_post_f32<false, true> : dsv4_hc_post_f32<false, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
@@ -409,21 +328,6 @@ static void ggml_cuda_op_dsv4_hc_post_impl(
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
-}
-
-void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_op_dsv4_hc_post_impl(ctx, dst, dst->src[2], false, 0.0f, 0.0f);
-}
-
-// fused scale + sigmoid + scale + dsv4_hc_post: `post` is the raw gate of
-// scale_out*sigmoid(scale_in*post), so the whole chain runs in this kernel
-void ggml_cuda_op_dsv4_hc_post_gated(
-        ggml_backend_cuda_context & ctx,
-        ggml_tensor *               dst,
-        const ggml_tensor *         scale_in,
-        const ggml_tensor *         scale_out) {
-    ggml_cuda_op_dsv4_hc_post_impl(ctx, dst, scale_in->src[0], true,
-            ggml_get_op_params_f32(scale_in,  0),
-            ggml_get_op_params_f32(scale_out, 0));
+            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
+            gate_in, gate_out);
 }
