@@ -6,6 +6,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
+#include "ggml-cuda/amax-scale.cuh"
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
@@ -3486,6 +3487,104 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     return true;
 }
 
+struct ggml_cuda_amax_scale_match {
+    const ggml_tensor * cur   = nullptr;
+    ggml_tensor *       scale = nullptr;
+};
+
+// Fused per expert-token power-of-two rescale of the MoE down projection:
+//   ABS -> POOL_1D(MAX) -> SCALE -> LOG -> SCALE -> CEIL -> CLAMP -> SCALE -> EXP
+// Everything after the row reduction acts on a [1, n_expert, n_tokens] tensor, so the chain
+// collapses into one kernel that writes only the scale factor.
+static bool ggml_cuda_match_amax_scale(
+        const ggml_cgraph * cgraph,
+        int                 node_idx,
+        ggml_cuda_amax_scale_match & match) {
+    constexpr int n_nodes = 9;
+    if (node_idx + n_nodes > cgraph->n_nodes) {
+        return false;
+    }
+
+    const ggml_op ops[n_nodes] = {
+        GGML_OP_UNARY, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_LOG, GGML_OP_SCALE,
+        GGML_OP_UNARY, GGML_OP_CLAMP,   GGML_OP_SCALE, GGML_OP_UNARY,
+    };
+
+    const ggml_tensor * node_abs    = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * node_pool   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * node_scale0 = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * node_log    = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * node_scale1 = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * node_ceil   = cgraph->nodes[node_idx + 5];
+    const ggml_tensor * node_clamp  = cgraph->nodes[node_idx + 6];
+    const ggml_tensor * node_scale2 = cgraph->nodes[node_idx + 7];
+    const ggml_tensor * node_exp    = cgraph->nodes[node_idx + 8];
+
+    if (node_abs->op    != GGML_OP_UNARY   || node_pool->op   != GGML_OP_POOL_1D ||
+        node_scale0->op != GGML_OP_SCALE   || node_log->op    != GGML_OP_LOG     ||
+        node_scale1->op != GGML_OP_SCALE   || node_ceil->op   != GGML_OP_UNARY   ||
+        node_clamp->op  != GGML_OP_CLAMP   || node_scale2->op != GGML_OP_SCALE   ||
+        node_exp->op    != GGML_OP_UNARY) {
+        return false;
+    }
+
+    if (ggml_get_unary_op(node_abs)  != GGML_UNARY_OP_ABS  ||
+        ggml_get_unary_op(node_ceil) != GGML_UNARY_OP_CEIL ||
+        ggml_get_unary_op(node_exp)  != GGML_UNARY_OP_EXP) {
+        return false;
+    }
+
+    if (node_pool->src[0]   != node_abs    || node_scale0->src[0] != node_pool  ||
+        node_log->src[0]    != node_scale0 || node_scale1->src[0] != node_log   ||
+        node_ceil->src[0]   != node_scale1 || node_clamp->src[0]  != node_ceil  ||
+        node_scale2->src[0] != node_clamp  || node_exp->src[0]    != node_scale2) {
+        return false;
+    }
+
+    const ggml_tensor * cur = node_abs->src[0];
+    if (cur == nullptr || cur->type != GGML_TYPE_F32 || !ggml_is_contiguous(cur)) {
+        return false;
+    }
+    if (node_exp->type != GGML_TYPE_F32 || !ggml_is_contiguous(node_exp) ||
+            node_exp->ne[0] != 1     || node_exp->ne[1] != cur->ne[1] ||
+            node_exp->ne[2] != cur->ne[2] || node_exp->ne[3] != cur->ne[3]) {
+        return false;
+    }
+
+    // the pool must reduce full rows
+    const int32_t * pool_params = (const int32_t *) node_pool->op_params;
+    if (pool_params[0] != GGML_OP_POOL_MAX || pool_params[1] != cur->ne[0] ||
+            pool_params[2] != cur->ne[0] || pool_params[3] != 0) {
+        return false;
+    }
+
+    auto scale_is = [](const ggml_tensor * node, float expected) {
+        float params[2];
+        memcpy(params, node->op_params, sizeof(params));
+        return params[0] == expected && params[1] == 0.0f;
+    };
+    if (!scale_is(node_scale0, 1.0f/1024.0f)             ||
+        !scale_is(node_scale1, 1.4426950408889634f)      ||
+        !scale_is(node_scale2, 0.6931471805599453f)) {
+        return false;
+    }
+
+    float clamp_params[2];
+    memcpy(clamp_params, node_clamp->op_params, sizeof(clamp_params));
+    if (clamp_params[0] != 0.0f || clamp_params[1] != 127.0f) {
+        return false;
+    }
+
+    const int out_nodes[] = { node_idx + 8 };
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, n_nodes, ops, out_nodes, 1)) {
+        return false;
+    }
+
+    match.cur   = cur;
+    match.scale = const_cast<ggml_tensor *>(node_exp);
+    return true;
+}
+
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -3810,6 +3909,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
+            }
+        }
+    }
+
+    // amax rescale chain of the MoE down projection
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_ABS) {
+        ggml_cuda_amax_scale_match match;
+        if (ggml_cuda_match_amax_scale(cgraph, i, match)) {
+            const int out_nodes[] = { i + 8 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, out_nodes, 1)) {
+                ggml_cuda_op_amax_scale(*cuda_ctx, match.cur, match.scale);
+                return 8;
             }
         }
     }
