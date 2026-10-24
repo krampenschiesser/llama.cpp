@@ -994,7 +994,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         if (ud->model->arch == LLM_ARCH_STEP35 || ud->model->arch == LLM_ARCH_LAGUNA) {
             GGML_ASSERT(segments.size() == 1);
-            const int64_t max_el      = segments[0].first;
             if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
                 return {hparams.n_head(il) / hparams.n_head_kv(il)};
             }
