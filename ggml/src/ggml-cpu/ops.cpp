@@ -12,6 +12,12 @@
 #include <cfloat>
 #include <cmath>
 
+// ISA-specialized dequantizer when available, generic reference otherwise
+static inline ggml_to_float_t ggml_cpu_to_float(enum ggml_type type) {
+    const ggml_to_float_t fn = ggml_get_type_traits_cpu(type)->to_float;
+    return fn ? fn : ggml_get_type_traits(type)->to_float;
+}
+
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(
@@ -482,7 +488,7 @@ static void ggml_compute_forward_dup_from_q(
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const ggml_type type = src0->type;
-    ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
+    ggml_to_float_t const dequantize_row_q = ggml_cpu_to_float(type);
 
     size_t qk = ggml_blck_size(type);
     const int64_t nr = ggml_nelements(src1) / qk;
@@ -593,7 +599,7 @@ static void ggml_compute_forward_add_q_f32(
 
     const ggml_type type = src0->type;
     const ggml_type dtype = dst->type;
-    ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
+    ggml_to_float_t const dequantize_row_q = ggml_cpu_to_float(type);
     ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dtype)->from_float;
 
     // we don't support permuted src0 or src1
@@ -944,7 +950,7 @@ static void ggml_compute_forward_add1_q_f32(
     GGML_TENSOR_UNARY_OP_LOCALS
 
     const ggml_type type = src0->type;
-    ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
+    ggml_to_float_t const dequantize_row_q = ggml_cpu_to_float(type);
     ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(type)->from_float;
 
     // we don't support permuted src0
@@ -4774,7 +4780,7 @@ static void ggml_compute_forward_out_prod_q_f32(
     const int nth = params->nth;
 
     const ggml_type type = src0->type;
-    ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
+    ggml_to_float_t const dequantize_row_q = ggml_cpu_to_float(type);
 
     GGML_ASSERT(ne02 == ne12);
     GGML_ASSERT(ne03 == ne13);
@@ -5303,7 +5309,7 @@ static void ggml_compute_forward_get_rows_q(
     const int64_t nr = ggml_nelements(src1);
 
     const ggml_type type = src0->type;
-    ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
+    ggml_to_float_t const dequantize_row_q = ggml_cpu_to_float(type);
 
     assert(ne0  == nc);
     assert(ne02 == ne11);
@@ -9012,7 +9018,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
     ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
-    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
+    ggml_to_float_t   const v_to_float     = ggml_cpu_to_float(v->type);
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
@@ -12640,7 +12646,7 @@ void ggml_compute_forward_lightning_indexer(
     const int n_stream  = q->ne[3];
     const int n_kv      = k->ne[2];
 
-    ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
+    ggml_to_float_t const k_to_float = ggml_cpu_to_float(k->type);
     GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && "lightning indexer: unsupported K-type");
 
     const int nr  = n_kv;

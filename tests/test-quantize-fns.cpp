@@ -295,6 +295,80 @@ static int test_quantize_imatrix_degenerate(bool verbose) {
     return num_failed;
 }
 
+
+// Compare the CPU (ISA-specialized) dequantizer against the generic reference
+static int test_dequantize_q(bool verbose) {
+    const int64_t test_size = 4096;
+
+    std::vector<float> test_data(test_size);
+    generate_data(0, test_size, test_data.data());
+
+    std::vector<float> imatrix(test_size, 1.0f);
+    std::vector<float> out_ref(test_size + 8);
+    std::vector<float> out_cpu(test_size + 8);
+
+    printf("%s: dequantize_row_q\n", __func__);
+
+    int num_failed = 0;
+
+    for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+        const ggml_type type = (ggml_type) i;
+
+        if (ggml_type_name(type) == NULL) {
+            continue;
+        }
+
+        const struct ggml_type_traits     * qfns     = ggml_get_type_traits(type);
+        const struct ggml_type_traits_cpu * qfns_cpu = ggml_get_type_traits_cpu(type);
+
+        if (qfns->to_float == NULL ||
+                type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_F32) {
+            continue;
+        }
+
+        const size_t row_size = ggml_row_size(type, test_size);
+        std::vector<uint8_t> tmp_q(row_size, 0);
+
+        ggml_quantize_init(type);
+        ggml_quantize_chunk(type, test_data.data(), tmp_q.data(), 0, 1, test_size, imatrix.data());
+
+        qfns->to_float(tmp_q.data(), out_ref.data(), test_size);
+
+        // NULL means no ISA kernel for this type in this build: fall back to the reference
+        const ggml_to_float_t to_float = qfns_cpu->to_float ? qfns_cpu->to_float : qfns->to_float;
+
+        bool  failed   = false;
+        float max_diff = 0.0f;
+
+        // unaligned destinations must work too (GET_ROWS rows are not 64B aligned)
+        for (int off : {0, 1, 3, 7}) {
+            std::fill(out_cpu.begin(), out_cpu.end(), 0.0f);
+            to_float(tmp_q.data(), out_cpu.data() + off, test_size);
+
+            for (int64_t j = 0; j < test_size; j++) {
+                const float a    = out_cpu[off + j];
+                const float b    = out_ref[j];
+                const float diff = fabsf(a - b);
+                if (std::isnan(diff)) {
+                    failed = true;
+                    continue;
+                }
+                max_diff = std::max(max_diff, diff);
+                if (diff > 1e-6f*fmaxf(1.0f, fabsf(b))) {
+                    failed = true;
+                }
+            }
+        }
+
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("%5s dequantize: %s (max diff %g)\n", ggml_type_name(type), RESULT_STR[failed], max_diff);
+        }
+    }
+
+    return num_failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -316,6 +390,7 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_dequantize_q(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);
 
     if (num_failed || verbose) {

@@ -101,6 +101,36 @@ void ggml_vec_dot_iq1_m_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 void ggml_vec_dot_iq4_nl_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq4_xs_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+// Dequantization (to_float) kernels, x86 only for now
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+void ggml_dequantize_row_q4_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q4_1(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q5_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q5_1(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q8_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_iq4_nl(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q4_K(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q5_K(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_iq4_xs(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q8_K(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_tq1_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_tq2_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q2_K(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q3_K(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q6_K(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_mxfp4(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_nvfp4(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q1_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_q2_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_iq1_m(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_iq1_s(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_iq2_s(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_iq2_xs(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_iq2_xxs(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_iq3_s(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_dequantize_row_iq3_xxs(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
