@@ -2210,6 +2210,44 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     const int nb = n / QK_K;
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__)
+    const __m512i m3_512 = _mm512_set1_epi8(3);
+    // 2-bit fields of each byte: bits 0-1 / 2-3 in the low half of the duplicated load, 4-5 / 6-7 in the high half
+    const __m512i ctrl_01 = _mm512_set_epi64(
+            0x3A322A221A120A02, 0x3A322A221A120A02, 0x3A322A221A120A02, 0x3A322A221A120A02,
+            0x3830282018100800, 0x3830282018100800, 0x3830282018100800, 0x3830282018100800);
+    const __m512i ctrl_23 = _mm512_add_epi8(ctrl_01, _mm512_set1_epi8(4));
+
+    __m512 sumf = _mm512_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        // two chains: vpdpbusd latency does not serialise the j loop
+        __m512i sumi0 = _mm512_setzero_si512();
+        __m512i sumi1 = _mm512_setzero_si512();
+
+        for (size_t j = 0; j < sizeof(x->qs); j += 32) {
+            // one 32-byte load duplicated, two multishifts give the four 2-bit fields
+            const __m512i qx = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *) (x[i].qs + j)));
+            const __m512i qx01 = _mm512_and_si512(_mm512_multishift_epi64_epi8(ctrl_01, qx), m3_512);
+            const __m512i qx23 = _mm512_and_si512(_mm512_multishift_epi64_epi8(ctrl_23, qx), m3_512);
+
+            const __m512i qy01 = _mm512_loadu_si512((const __m512i *) (y[i].qs + j*4 +  0));
+            const __m512i qy23 = _mm512_loadu_si512((const __m512i *) (y[i].qs + j*4 + 64));
+
+            sumi0 = _mm512_dpbusd_epi32(sumi0, qx01, qy01);
+            sumi1 = _mm512_dpbusd_epi32(sumi1, qx23, qy23);
+        }
+
+        const __m512i ysum = _mm512_cvtepi16_epi32(_mm256_loadu_si256((const __m256i *) y[i].bsums));
+        const __m512i sumi = _mm512_sub_epi32(_mm512_add_epi32(sumi0, sumi1), ysum);
+        const __m512 d = _mm512_set1_ps(y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d));
+
+        sumf = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sumi), d, sumf);
+    }
+
+    *s = hsum_float_16(sumf);
+
+#else
     __m512 sumf = _mm512_setzero_ps();
 #if defined(__AVX512VBMI__)
     const __m512i m3_512 = _mm512_set1_epi8(3);
@@ -2262,6 +2300,8 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     }
 
     *s = hsum_float_16(sumf);
+
+#endif
 
 #elif defined(__AVX2__)
     __m256 sumf = _mm256_setzero_ps();
@@ -5601,6 +5641,62 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__)
+    // +128 biased codes let vpdpbusd take the weights as u8, which drops the abs/sign
+    // fixup and the 16-bit madd stage; the bias is removed per 32-wide sub-block
+    const __m512i values_u = _mm512_xor_si512(
+            _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) kvalues_iq4nl)),
+            _mm512_set1_epi8(-128));
+    // the 8 6-bit sub-block scales unpack into int32 lanes: bit offsets of the low nibbles
+    // and of the 2-bit high fields of scales_h
+    const __m256i sh_l = _mm256_set_epi32(28, 24, 20, 16, 12, 8, 4, 0);
+    const __m256i sh_h = _mm256_set_epi32(14, 12, 10, 8, 6, 4, 2, 0);
+    const __m256i m4_32 = _mm256_set1_epi32(0x0f);
+    const __m256i m3_32 = _mm256_set1_epi32(0x03);
+    const __m256i m32_32 = _mm256_set1_epi32(32);
+    const __m512i sel_step = _mm512_set1_epi32(2);
+
+    __m512 accum = _mm512_setzero_ps();
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const uint8_t * qs = x[ibl].qs;
+        const int8_t  * q8 = y[ibl].qs;
+
+        uint32_t sl;
+        memcpy(&sl, x[ibl].scales_l, sizeof(sl));
+        __m256i ls = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32((int) sl), sh_l), m4_32),
+                _mm256_slli_epi32(_mm256_and_si256(
+                        _mm256_srlv_epi32(_mm256_set1_epi32((int) x[ibl].scales_h), sh_h), m3_32), 4));
+        ls = _mm256_sub_epi32(ls, m32_32);
+        const __m512i scales = MM512_SET_M256I(ls, ls);
+        // -128 * sub-block bsum total, as int32 lanes
+        const __m256i bcorr8 = _mm256_madd_epi16(
+                _mm256_loadu_si256((const __m256i *) y[ibl].bsums), _mm256_set1_epi16(-128));
+        const __m512i bcorr = MM512_SET_M256I(bcorr8, bcorr8);
+
+        __m512i sumi = _mm512_setzero_si512();
+        // in step k the low 8 int32 lanes hold sub-block 2k and the high 8 hold 2k+1
+        __m512i sel = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+        for (int ib = 0; ib < QK_K/32; ib += 2) {
+            const __m512i qx = unpack_nibbles_64(values_u, qs); qs += 32;
+            const __m512i qy = _mm512_loadu_si512((const __m512i *) q8); q8 += 64;
+
+            // the bias correction is a per sub-block scalar, so it lands in one dpbusd lane only (0 and 8)
+            const __m512i p = _mm512_dpbusd_epi32(
+                    _mm512_maskz_permutexvar_epi32((__mmask16) 0x0101, sel, bcorr), qx, qy);
+            sumi = _mm512_add_epi32(sumi,
+                    _mm512_mullo_epi32(p, _mm512_permutexvar_epi32(sel, scales)));
+            sel = _mm512_add_epi32(sel, sel_step);
+        }
+
+        accum = _mm512_fmadd_ps(_mm512_set1_ps(GGML_CPU_FP16_TO_FP32(x[ibl].d)*y[ibl].d),
+                _mm512_cvtepi32_ps(sumi), accum);
+    }
+
+    *s = hsum_float_16(accum);
+
+#else
+
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
 #if defined(__AVX512VBMI__)
     const __m512i values512 = _mm512_broadcast_i32x4(values128);
@@ -5638,6 +5734,8 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     }
 
     *s = hsum_float_16(accum);
+
+#endif
 
 #elif defined __AVX2__
 

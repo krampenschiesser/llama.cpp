@@ -66,6 +66,12 @@ struct block_q8_0 {
     int8_t      qs[QK8_0];
 };
 
+// block_q8_0x4 from ggml/src/ggml-cpu/repack.h, four q8_0 rows interleaved for the gemm
+struct block_q8_0x4 {
+    ggml_fp16_t d[4];
+    int8_t      qs[QK8_0 * 4];
+};
+
 static_assert(sizeof(block_q4_Kx8) == 16 * sizeof(ggml_fp16_t) + 96 + 1024, "wrong block_q4_Kx8 size");
 static_assert(sizeof(block_q5_Kx8) == 16 * sizeof(ggml_fp16_t) + 96 + 256 + 1024, "wrong block_q5_Kx8 size");
 static_assert(sizeof(block_q8_K) == sizeof(float) + QK_K + (QK_K / 16) * sizeof(int16_t), "wrong block_q8_K size");
@@ -74,6 +80,7 @@ static_assert(sizeof(block_q4_0x8) == 8 * sizeof(ggml_fp16_t) + QK8_0 * 4, "wron
 static_assert(sizeof(block_iq4_nlx8) == 8 * sizeof(ggml_fp16_t) + QK8_0 * 4, "wrong block_iq4_nlx8 size");
 static_assert(sizeof(block_mxfp4x8) == 8 + QK8_0 * 4, "wrong block_mxfp4x8 size");
 static_assert(sizeof(block_q8_0) == sizeof(ggml_fp16_t) + QK8_0, "wrong block_q8_0 size");
+static_assert(sizeof(block_q8_0x4) == 4 * sizeof(ggml_fp16_t) + QK8_0 * 4, "wrong block_q8_0x4 size");
 
 // gemv and gemm signatures shared by the 8x8 kernels and their generic references
 typedef void (*gemv_fn)(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
@@ -95,9 +102,16 @@ void ggml_gemv_iq4_nl_8x8_q8_0(int n, float * s, size_t bs, const void * vx, con
 void ggml_gemv_iq4_nl_8x8_q8_0_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemv_mxfp4_8x8_q8_0(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemv_mxfp4_8x8_q8_0_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
+void ggml_gemm_q4_0_8x8_q8_0(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
+void ggml_gemm_q4_0_8x8_q8_0_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
+void ggml_gemm_iq4_nl_8x8_q8_0(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
+void ggml_gemm_iq4_nl_8x8_q8_0_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
+void ggml_gemm_mxfp4_8x8_q8_0(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
+void ggml_gemm_mxfp4_8x8_q8_0_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void quantize_row_q8_K_ref(const float * x, block_q8_K * y, int64_t k);
 void quantize_row_q8_0_generic(const float * x, void * vy, int64_t k);
 void ggml_quantize_mat_q8_K_4x8_generic(const float * x, void * vy, int64_t k);
+void ggml_quantize_mat_q8_0_4x8_generic(const float * x, void * vy, int64_t k);
 }
 
 // failed shapes; main exits non-zero on any failures
@@ -143,6 +157,18 @@ static void fill_packed(std::vector<block_t> & packed) {
     }
 }
 
+// some x86 builds fall back to the scalar single row reference for a gemv (e.g. the q5_K 8x8
+// gemv without AVX-512 VNNI); that reference ignores nr, so only compare nr > 1 when the kernel
+// actually writes the later rows
+static bool gemv_writes_rows(gemv_fn kernel, int n, int nc, int nr, const void * vx, const void * vy) {
+    const int64_t out_n = (int64_t) (nr - 1) * nr + nc;
+    const float sentinel = -12345.0f;
+    std::vector<float> out(out_n, sentinel);
+    kernel(n, out.data(), nc, vx, vy, nr, nc);
+    // a single row fallback writes only nc values, the last output value stays untouched
+    return out[out_n - 1] != sentinel;
+}
+
 template <typename block_t>
 static void test_shape(gemv_fn kernel, gemv_fn ref_fn, int n, int nc, int nr) {
     const int nb = n / QK_K;
@@ -159,6 +185,11 @@ static void test_shape(gemv_fn kernel, gemv_fn ref_fn, int n, int nc, int nr) {
             row[i] = 5.0f * (rand_f32() - 0.5f);
         }
         quantize_row_q8_K_ref(row.data(), act.data() + (size_t) y * nb, n);
+    }
+
+    if (nr > 1 && !gemv_writes_rows(kernel, n, nc, nr, packed.data(), act.data())) {
+        printf("SKIP n = %4d nc = %3d nr = %d : gemv only writes one row, the build uses the single row fallback\n", n, nc, nr);
+        return;
     }
 
     // the kernel stores row y at s + y * nr, so the written range is [0, (nr - 1) * nr + nc)
@@ -202,14 +233,10 @@ static void test_shape(gemv_fn kernel, gemv_fn ref_fn, int n, int nc, int nr) {
            pass ? "OK  " : "FAIL", n, nc, nr, max_err, rms_err, max_ref);
 }
 
-// gemv of the 8-column 4-bit layouts: nr activation rows of n quants against nc columns
+// the kernels and the reference read the same packed bytes, so any values are valid; mxfp4 needs
+// valid E8M0 exponents
 template <typename block_t>
-static void test_gemv_b32_shape(const char * fmt, gemv_fn kernel, gemv_fn ref_fn, int n, int nc, int nr) {
-    const int nb = n / QK8_0;
-    GGML_ASSERT(n % QK8_0 == 0);
-    GGML_ASSERT(nc % 8 == 0);
-
-    std::vector<block_t> packed((size_t) nb * (nc / 8));
+static void fill_b32_packed(std::vector<block_t> & packed) {
     for (size_t i = 0; i < packed.size(); ++i) {
         if constexpr (std::is_same_v<block_t, block_mxfp4x8>) {
             // E8M0 exponents 0 and 1 are the subnormal scales, 2 .. 132 the normal ones
@@ -226,6 +253,17 @@ static void test_gemv_b32_shape(const char * fmt, gemv_fn kernel, gemv_fn ref_fn
             packed[i].qs[j] = (uint8_t) (rand() & 0xFF);
         }
     }
+}
+
+// gemv of the 8-column 4-bit layouts: nr activation rows of n quants against nc columns
+template <typename block_t>
+static void test_gemv_b32_shape(const char * fmt, gemv_fn kernel, gemv_fn ref_fn, int n, int nc, int nr) {
+    const int nb = n / QK8_0;
+    GGML_ASSERT(n % QK8_0 == 0);
+    GGML_ASSERT(nc % 8 == 0);
+
+    std::vector<block_t> packed((size_t) nb * (nc / 8));
+    fill_b32_packed(packed);
 
     std::vector<block_q8_0> act((size_t) nr * nb);
     std::vector<float> row(n);
@@ -342,6 +380,74 @@ static void test_gemm_shape(gemm_fn kernel, gemm_fn ref_fn, int n, int nc, int n
            pass ? "OK  " : "FAIL", n, nc, nr, max_err, rms_err, max_ref);
 }
 
+// gemm of the 8-column 4-bit layouts over nr activation rows and nc columns, nr % 4 == 0 and
+// nc % 8 == 0; bs is the destination row stride in floats, so nc gives a dense [nr][nc] output
+template <typename block_t>
+static void test_gemm_b32_shape(const char * fmt, gemm_fn kernel, gemm_fn ref_fn, int n, int nc, int nr) {
+    const int nb = n / QK8_0;
+    GGML_ASSERT(n % QK8_0 == 0);
+    GGML_ASSERT(nc % 8 == 0);
+    GGML_ASSERT(nr % 4 == 0);
+
+    std::vector<block_t> packed((size_t) nb * (nc / 8));
+    fill_b32_packed(packed);
+
+    // one block_q8_0x4 per four activation rows and 32-quant block
+    std::vector<block_q8_0x4> act((size_t) (nr / 4) * nb);
+    std::vector<float> rows((size_t) 4 * n);
+    for (int y = 0; y < nr / 4; ++y) {
+        for (int i = 0; i < 4 * n; ++i) {
+            rows[i] = 5.0f * (rand_f32() - 0.5f);
+        }
+        ggml_quantize_mat_q8_0_4x8_generic(rows.data(), act.data() + (size_t) y * nb, n);
+    }
+
+    const int64_t out_n = (int64_t) nr * nc;
+    const float sentinel = -12345.0f;
+    std::vector<float> ref(out_n, sentinel);
+    std::vector<float> out(out_n, sentinel);
+
+    ref_fn(n, ref.data(), nc, packed.data(), act.data(), nr, nc);
+    kernel(n, out.data(), nc, packed.data(), act.data(), nr, nc);
+
+    int64_t unwritten = 0;
+    for (int64_t i = 0; i < out_n; ++i) {
+        if (out[i] == sentinel) {
+            ++unwritten;
+        }
+    }
+
+    float max_err, rms_err, max_ref = 0.0f;
+    compare_f32(ref.data(), out.data(), out_n, &max_err, &rms_err);
+    for (int64_t i = 0; i < out_n; ++i) {
+        if (fabsf(ref[i]) > max_ref) {
+            max_ref = fabsf(ref[i]);
+        }
+    }
+
+    // the reference reads the scales through the fp16 and E8M0 tables, filled by ggml_cpu_init
+    if (max_ref == 0.0f) {
+        ++n_failed;
+        printf("FAIL gemm %-6s n = %4d nc = %3d nr = %2d : reference is all zero, CPU backend not initialized?\n",
+               fmt, n, nc, nr);
+        return;
+    }
+    if (unwritten != 0) {
+        ++n_failed;
+        printf("FAIL gemm %-6s n = %4d nc = %3d nr = %2d : %lld output values were not written\n",
+               fmt, n, nc, nr, (long long) unwritten);
+        return;
+    }
+
+    const float tol  = 1e-4f * fmaxf(1.0f, max_ref);
+    const bool  pass = max_err <= tol;
+    if (!pass) {
+        ++n_failed;
+    }
+    printf("%s gemm %-6s n = %4d nc = %3d nr = %2d : max_err = %.6g rms_err = %.6g max |ref| = %.6g\n",
+           pass ? "OK  " : "FAIL", fmt, n, nc, nr, max_err, rms_err, max_ref);
+}
+
 int main(void) {
     srand(42);
 
@@ -387,6 +493,17 @@ int main(void) {
             for (size_t k = 0; k < sizeof(gemm_nrs)/sizeof(gemm_nrs[0]); ++k) {
                 test_gemm_shape<block_q4_Kx8>(ggml_gemm_q4_K_8x8_q8_K, ggml_gemm_q4_K_8x8_q8_K_generic, ns[i], gemm_ncs[j], gemm_nrs[k]);
                 test_gemm_shape<block_q5_Kx8>(ggml_gemm_q5_K_8x8_q8_K, ggml_gemm_q5_K_8x8_q8_K_generic, ns[i], gemm_ncs[j], gemm_nrs[k]);
+            }
+        }
+    }
+
+    // gemm of the 8-column 4-bit layouts against the scalar generic gemm, same nr/nc grid
+    for (size_t i = 0; i < sizeof(ns)/sizeof(ns[0]); ++i) {
+        for (size_t j = 0; j < sizeof(gemm_ncs)/sizeof(gemm_ncs[0]); ++j) {
+            for (size_t k = 0; k < sizeof(gemm_nrs)/sizeof(gemm_nrs[0]); ++k) {
+                test_gemm_b32_shape<block_q4_0x8>  ("q4_0",   ggml_gemm_q4_0_8x8_q8_0,   ggml_gemm_q4_0_8x8_q8_0_generic,   ns[i], gemm_ncs[j], gemm_nrs[k]);
+                test_gemm_b32_shape<block_iq4_nlx8>("iq4_nl", ggml_gemm_iq4_nl_8x8_q8_0, ggml_gemm_iq4_nl_8x8_q8_0_generic, ns[i], gemm_ncs[j], gemm_nrs[k]);
+                test_gemm_b32_shape<block_mxfp4x8> ("mxfp4",  ggml_gemm_mxfp4_8x8_q8_0,  ggml_gemm_mxfp4_8x8_q8_0_generic,  ns[i], gemm_ncs[j], gemm_nrs[k]);
             }
         }
     }

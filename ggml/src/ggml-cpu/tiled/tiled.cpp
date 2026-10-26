@@ -231,6 +231,36 @@ static void tiled_unpack_src0(const block_q2_K * rows, int64_t row_stride, int n
     }
 }
 
+// tq2_0: ternary 2-bit codes, no scale. Byte b field l maps to element 128*(b>>5) + 32*l + (b&31)
+// and the format stores -1, 0, 1 as 0, 1, 2 (see dequantize_row_tq2_0); the -1 offset is
+// corrected by BIAS = 1 below, so the codes go into the tile unsigned and scales are 1
+static void tiled_unpack_src0(const block_tq2_0 * rows, int64_t row_stride, int n_rows, tiled_tile_src0 * tile, int num_k) {
+    GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
+    constexpr int NB = 8; // 32-wide subblocks
+    const int qk_stride = num_k * TILED_TILE_K;
+    const int nb_stride = NB * num_k;
+    for (int slab = 0; slab < num_k; slab++) {
+        for (int r = 0; r < n_rows; r++) {
+            const int d_off = slab * TILED_MICRO + r;
+            const int q_off = r * qk_stride + slab * TILED_TILE_K;
+            const int s_off = r * nb_stride + slab * NB;
+            const block_tq2_0 & x = rows[r * row_stride + slab];
+            tile->d[d_off] = ggml_fp16_to_fp32(x.d);
+
+            uint8_t * q = &tile->q[q_off];
+            for (int half = 0; half < 2; half++) {
+                const uint8_t * s = x.qs + 32 * half;
+                uint8_t * out = q + 128 * half;
+                tiled_unpk_2bit<0>(s, out + 0);
+                tiled_unpk_2bit<2>(s, out + 32);
+                tiled_unpk_2bit<4>(s, out + 64);
+                tiled_unpk_2bit<6>(s, out + 96);
+            }
+            for (int s = 0; s < NB; s++) { tile->scales[s_off + s] = 1; }
+        }
+    }
+}
+
 // iq4_xs: 4-bit codes through the kvalues_iq4nl LUT, 6-bit scales per 32, no min.
 // LUT values are stored as kvalues + 128 so the +128 shift the kernel applies to
 // the activations cancels against the bsums correction (BIAS = 128); the +128 is
@@ -619,6 +649,7 @@ static bool ggml_tiled_supported(const struct ggml_tensor * src0,
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q2_K:
+        case GGML_TYPE_TQ2_0:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
@@ -1178,6 +1209,8 @@ static bool ggml_tiled_matmul_type_dispatch(const struct ggml_compute_params * p
             return tiled_matmul_dispatch<block_q3_K, 16, false,  4, true>(params, dst, expert_rows, cur_a, cne1, scratch);
         case GGML_TYPE_Q2_K:
             return tiled_matmul_dispatch<block_q2_K, 16, true,  0, false>(params, dst, expert_rows, cur_a, cne1, scratch);
+        case GGML_TYPE_TQ2_0:
+            return tiled_matmul_dispatch<block_tq2_0, 32, false, 1, false>(params, dst, expert_rows, cur_a, cne1, scratch);
         case GGML_TYPE_IQ4_XS:
             return tiled_matmul_dispatch<block_iq4_xs, 32, false, 128, false>(params, dst, expert_rows, cur_a, cne1, scratch);
         case GGML_TYPE_IQ2_XXS:

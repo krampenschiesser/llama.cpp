@@ -556,6 +556,9 @@ template void tiled_run_microtile<16, false, 4, true>(const tiled_tile_src0 & sr
 // q2_K: BIAS = 0
 template void tiled_run_microtile<16, true, 0, false>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                                int i0, int j0, int num_k, int slab, float * buf, int buf_stride);
+// tq2_0: BIAS = 1, sign trick (Wmax 1)
+template void tiled_run_microtile<32, false, 1, false>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                                int i0, int j0, int num_k, int slab, float * buf, int buf_stride);
 
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))

@@ -456,6 +456,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                     list(APPEND ARCH_FLAGS -mamx-bf16)
                     list(APPEND ARCH_DEFINITIONS GGML_AMX_BF16)
                 endif()
+                # the new 512-bit gemv/gemm kernels are compiled out without VNNI+VBMI
+                if (GGML_AVX512 AND (NOT GGML_AVX512_VNNI OR NOT GGML_AVX512_VBMI))
+                    message(WARNING "GGML_AVX512 is enabled without GGML_AVX512_VNNI and/or GGML_AVX512_VBMI: the new 512-bit gemv/gemm kernels need VNNI+VBMI and will silently compile out")
+                endif()
             endif()
         endif()
 
