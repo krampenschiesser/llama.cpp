@@ -76,8 +76,13 @@ struct cpuid_x86 {
     bool _3DNOWEXT(void) { return is_amd && f_81_edx[30]; }
     bool _3DNOW(void) { return is_amd && f_81_edx[31]; }
 
+    bool AVX512_IFMA(void) { return f_7_ebx[21]; }
     bool AVX512_VBMI(void) { return f_7_ecx[1]; }
+    bool AVX512_VBMI2(void) { return f_7_ecx[6]; }
+    bool GFNI(void) { return f_7_ecx[8]; }
     bool AVX512_VNNI(void) { return f_7_ecx[11]; }
+    bool AVX512_BITALG(void) { return f_7_ecx[12]; }
+    bool AVX512_VPOPCNTDQ(void) { return f_7_ecx[14]; }
     bool AVX512_FP16(void) { return f_7_edx[23]; }
     bool AVX512_BF16(void) { return f_7_1_eax[5]; }
     bool AVX_VNNI(void) { return f_7_1_eax[4]; }
@@ -317,6 +322,26 @@ static int ggml_backend_cpu_x86_score() {
 #ifdef GGML_AMX_INT8
     if (!is.AMX_INT8()) { return 0; }
     score += 1<<11;
+#endif
+#ifdef GGML_AVX512_VBMI2
+    if (!is.AVX512_VBMI2()) { return 0; }
+    score += 1<<12;
+#endif
+#ifdef GGML_AVX512_BITALG
+    if (!is.AVX512_BITALG()) { return 0; }
+    score += 1<<13;
+#endif
+#ifdef GGML_AVX512_VPOPCNTDQ
+    if (!is.AVX512_VPOPCNTDQ()) { return 0; }
+    score += 1<<14;
+#endif
+#ifdef GGML_AVX512_IFMA
+    if (!is.AVX512_IFMA()) { return 0; }
+    score += 1<<15;
+#endif
+#ifdef GGML_GFNI
+    if (!is.GFNI()) { return 0; }
+    score += 1<<16;
 #endif
 
     return score;

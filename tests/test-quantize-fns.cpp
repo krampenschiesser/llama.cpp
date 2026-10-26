@@ -369,6 +369,326 @@ static int test_dequantize_q(bool verbose) {
     return num_failed;
 }
 
+// The block layouts of ggml-common.h and the reference quantizers of ggml-quants.h
+// are internal headers, so the test declares the small part it needs here.
+struct block_q8_0 {
+    ggml_fp16_t d;
+    int8_t      qs[32];
+};
+static_assert(sizeof(block_q8_0) == 2 + 32, "wrong q8_0 block size/padding");
+
+struct block_q8_1 {
+    ggml_fp16_t d;
+    ggml_fp16_t s;
+    int8_t      qs[32];
+};
+static_assert(sizeof(block_q8_1) == 2 + 2 + 32, "wrong q8_1 block size/padding");
+
+struct block_q8_K {
+    float   d;
+    int8_t  qs[256];
+    int16_t bsums[16];
+};
+static_assert(sizeof(block_q8_K) == 4 + 256 + 32, "wrong q8_K block size/padding");
+
+// 4-row blocks of the repack path: the quants of the 4 rows are interleaved in groups of 8
+struct block_q8_0x4 {
+    ggml_fp16_t d[4];
+    int8_t      qs[4*32];
+};
+static_assert(sizeof(block_q8_0x4) == 4*2 + 4*32, "wrong q8_0x4 block size/padding");
+
+struct block_q8_Kx4 {
+    float   d[4];
+    int8_t  qs[4*256];
+    int16_t bsums[64];
+};
+static_assert(sizeof(block_q8_Kx4) == 4*4 + 4*256 + 64*2, "wrong q8_Kx4 block size/padding");
+
+extern "C" {
+void quantize_row_q8_0_ref(const float * x, block_q8_0 * y, int64_t k);
+void quantize_row_q8_1_ref(const float * x, block_q8_1 * y, int64_t k);
+void quantize_row_q8_K_ref(const float * x, block_q8_K * y, int64_t k);
+void ggml_quantize_mat_q8_0_4x8(const float * x, void * vy, int64_t k);
+void ggml_quantize_mat_q8_K_4x8(const float * x, void * vy, int64_t k);
+void ggml_vec_dot_q8_0_q8_0(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
+}
+
+// A code may differ by 1 where the value lands exactly on a rounding tie: the ISA
+// kernels round half to even, the reference uses roundf (half away from zero).
+static int count_quant_mismatches(const int8_t * a, const int8_t * b, size_t n) {
+    int n_bad = 0;
+    for (size_t i = 0; i < n; i++) {
+        const int diff = (int) a[i] - (int) b[i];
+        n_bad += diff > 1 || diff < -1;
+    }
+    return n_bad;
+}
+
+static float scale_rel_diff(float a, float b) {
+    return fabsf(a - b)/fmaxf(1.0f, fabsf(b));
+}
+
+// Compare the CPU (ISA-specialized) quantizer against the reference
+static int test_quantize_q(bool verbose) {
+    const int64_t test_size = 4096;
+
+    std::vector<float> test_data(test_size);
+    generate_data(0, test_size, test_data.data());
+
+    printf("%s: quantize_row_q\n", __func__);
+
+    int num_failed = 0;
+
+    {
+        const int64_t nb = test_size / 32;
+
+        std::vector<block_q8_0> q_cpu(nb);
+        std::vector<block_q8_0> q_ref(nb);
+
+        ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float(test_data.data(), q_cpu.data(), test_size);
+        quantize_row_q8_0_ref(test_data.data(), q_ref.data(), test_size);
+
+        int   n_bad  = 0;
+        float d_diff = 0.0f;
+
+        for (int64_t i = 0; i < nb; i++) {
+            n_bad  += count_quant_mismatches(q_cpu[i].qs, q_ref[i].qs, 32);
+            d_diff  = std::max(d_diff, scale_rel_diff(ggml_fp16_to_fp32(q_cpu[i].d), ggml_fp16_to_fp32(q_ref[i].d)));
+        }
+
+        const bool failed = n_bad != 0 || d_diff > 1e-6f;
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("%5s quantize: %s (%d codes off by more than 1, max d diff %g)\n",
+                   ggml_type_name(GGML_TYPE_Q8_0), RESULT_STR[failed], n_bad, d_diff);
+        }
+    }
+
+    {
+        const int64_t nb = test_size / 32;
+
+        std::vector<block_q8_1> q_cpu(nb);
+        std::vector<block_q8_1> q_ref(nb);
+
+        ggml_get_type_traits_cpu(GGML_TYPE_Q8_1)->from_float(test_data.data(), q_cpu.data(), test_size);
+        quantize_row_q8_1_ref(test_data.data(), q_ref.data(), test_size);
+
+        int   n_bad    = 0;
+        int   n_s_bad  = 0;
+        float d_diff   = 0.0f;
+
+        for (int64_t i = 0; i < nb; i++) {
+            int n_ties = 0;
+            for (int j = 0; j < 32; j++) {
+                const int diff = (int) q_cpu[i].qs[j] - (int) q_ref[i].qs[j];
+                n_bad  += diff > 1 || diff < -1;
+                n_ties += diff == 1 || diff == -1;
+            }
+            const float d_cpu = ggml_fp16_to_fp32(q_cpu[i].d);
+            const float d_ref = ggml_fp16_to_fp32(q_ref[i].d);
+            d_diff = std::max(d_diff, scale_rel_diff(d_cpu, d_ref));
+
+            // s = d * sum(qs), so every rounding tie may shift it by |d|
+            const float s_cpu = ggml_fp16_to_fp32(q_cpu[i].s);
+            const float s_ref = ggml_fp16_to_fp32(q_ref[i].s);
+            n_s_bad += fabsf(s_cpu - s_ref) > 1e-6f*fmaxf(1.0f, fabsf(s_ref)) + fabsf(d_ref)*n_ties;
+        }
+
+        const bool failed = n_bad != 0 || n_s_bad != 0 || d_diff > 1e-6f;
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("%5s quantize: %s (%d codes off by more than 1, %d s mismatches, max d diff %g)\n",
+                   ggml_type_name(GGML_TYPE_Q8_1), RESULT_STR[failed], n_bad, n_s_bad, d_diff);
+        }
+    }
+
+    {
+        const int64_t nb = test_size / 256;
+
+        std::vector<block_q8_K> q_cpu(nb);
+        std::vector<block_q8_K> q_ref(nb);
+
+        ggml_get_type_traits_cpu(GGML_TYPE_Q8_K)->from_float(test_data.data(), q_cpu.data(), test_size);
+        quantize_row_q8_K_ref(test_data.data(), q_ref.data(), test_size);
+
+        int   n_bad       = 0;
+        int   n_bsums_bad = 0;
+        float d_diff      = 0.0f;
+
+        for (int64_t i = 0; i < nb; i++) {
+            n_bad += count_quant_mismatches(q_cpu[i].qs, q_ref[i].qs, 256);
+            d_diff = std::max(d_diff, scale_rel_diff(q_cpu[i].d, q_ref[i].d));
+
+            for (int j = 0; j < 16; j++) {
+                int sum = 0;
+                for (int k = 0; k < 16; k++) {
+                    sum += q_cpu[i].qs[16*j + k];
+                }
+                n_bsums_bad += sum != q_cpu[i].bsums[j];
+            }
+        }
+
+        const bool failed = n_bad != 0 || n_bsums_bad != 0 || d_diff > 1e-6f;
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("%5s quantize: %s (%d codes off by more than 1, %d bsums mismatches, max d diff %g)\n",
+                   ggml_type_name(GGML_TYPE_Q8_K), RESULT_STR[failed], n_bad, n_bsums_bad, d_diff);
+        }
+    }
+
+    // The repack path quantizes 4 rows at once and interleaves 8 columns of each row
+    {
+        const int64_t ns[] = { 256, 1024, 4096 };
+
+        for (size_t it = 0; it < sizeof(ns)/sizeof(ns[0]); it++) {
+            const int64_t n = ns[it];
+            const int64_t nb = n / 32;
+
+            std::vector<float> data_in(4*n);
+            for (int r = 0; r < 4; r++) {
+                generate_data(0.5f*r, n, data_in.data() + r*n);
+            }
+
+            std::vector<block_q8_0x4> q_cpu(nb);
+            std::vector<block_q8_0>   q_ref(4*nb);
+
+            ggml_quantize_mat_q8_0_4x8(data_in.data(), q_cpu.data(), n);
+            for (int r = 0; r < 4; r++) {
+                quantize_row_q8_0_ref(data_in.data() + r*n, q_ref.data() + r*nb, n);
+            }
+
+            int n_bad = 0;
+            int n_d_bad = 0;
+
+            for (int64_t i = 0; i < nb; i++) {
+                for (int r = 0; r < 4; r++) {
+                    const block_q8_0 & ref = q_ref[r*nb + i];
+                    n_d_bad += ggml_fp16_to_fp32(q_cpu[i].d[r]) != ggml_fp16_to_fp32(ref.d);
+
+                    for (int m = 0; m < 32; m++) {
+                        // chunk of 8 columns of row r
+                        const int8_t q = q_cpu[i].qs[32*(m/8) + 8*r + (m%8)];
+                        const int diff = (int) q - (int) ref.qs[m];
+                        n_bad += diff > 1 || diff < -1;
+                    }
+                }
+            }
+
+            const bool failed = n_bad != 0 || n_d_bad != 0;
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("%5s quantize 4x8 n=%4d: %s (%d codes off by more than 1, %d d mismatches)\n",
+                       ggml_type_name(GGML_TYPE_Q8_0), (int) n, RESULT_STR[failed], n_bad, n_d_bad);
+            }
+        }
+
+        for (size_t it = 0; it < sizeof(ns)/sizeof(ns[0]); it++) {
+            const int64_t n = ns[it];
+            const int64_t nb = n / 256;
+
+            std::vector<float> data_in(4*n);
+            for (int r = 0; r < 4; r++) {
+                generate_data(0.5f*r, n, data_in.data() + r*n);
+            }
+
+            std::vector<block_q8_Kx4> q_cpu(nb);
+            std::vector<block_q8_K>   q_ref(4*nb);
+
+            ggml_quantize_mat_q8_K_4x8(data_in.data(), q_cpu.data(), n);
+            for (int r = 0; r < 4; r++) {
+                quantize_row_q8_K_ref(data_in.data() + r*n, q_ref.data() + r*nb, n);
+            }
+
+            int n_bad = 0;
+            int n_d_bad = 0;
+            int n_bsums_bad = 0;
+
+            for (int64_t i = 0; i < nb; i++) {
+                for (int r = 0; r < 4; r++) {
+                    const block_q8_K & ref = q_ref[r*nb + i];
+                    n_d_bad += q_cpu[i].d[r] != ref.d;
+
+                    int n_row_diff = 0;
+                    for (int m = 0; m < 256; m++) {
+                        const int8_t q = q_cpu[i].qs[32*(m/8) + 8*r + (m%8)];
+                        const int diff = (int) q - (int) ref.qs[m];
+                        n_bad += diff > 1 || diff < -1;
+                        n_row_diff += diff != 0;
+                    }
+
+                    for (int g = 0; g < 16; g++) {
+                        int sum = 0;
+                        for (int j = 0; j < 16; j++) {
+                            sum += q_cpu[i].qs[32*(2*g + j/8) + 8*r + (j%8)];
+                        }
+                        const int16_t bsums = q_cpu[i].bsums[16*(g/4) + 4*r + (g%4)];
+                        n_bsums_bad += sum != bsums;
+                        // the reference bsums only match when no code differs
+                        n_bsums_bad += n_row_diff == 0 && bsums != ref.bsums[g];
+                    }
+                }
+            }
+
+            const bool failed = n_bad != 0 || n_d_bad != 0 || n_bsums_bad != 0;
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("%5s quantize 4x8 n=%4d: %s (%d codes off by more than 1, %d d mismatches, %d bsums mismatches)\n",
+                       ggml_type_name(GGML_TYPE_Q8_K), (int) n, RESULT_STR[failed], n_bad, n_d_bad, n_bsums_bad);
+            }
+        }
+    }
+
+    return num_failed;
+}
+
+// q8_0 x q8_0 vec_dot for even and odd numbers of blocks: an odd nb must not drop the
+// last block, which the AVX512 branch leaves to the shared scalar tail
+static int test_vec_dot_q8_0_q8_0(bool verbose) {
+    printf("%s: vec_dot q8_0 x q8_0\n", __func__);
+
+    int num_failed = 0;
+
+    const int ns[] = { 32, 64, 96, 128, 160, 224, 256 };
+
+    for (size_t c = 0; c < sizeof(ns)/sizeof(ns[0]); c++) {
+        const int n  = ns[c];
+        const int nb = n / 32;
+
+        std::vector<float> a(n);
+        std::vector<float> b(n);
+        generate_data(0.0, n, a.data());
+        generate_data(1.0, n, b.data());
+
+        std::vector<block_q8_0> qa(nb);
+        std::vector<block_q8_0> qb(nb);
+        quantize_row_q8_0_ref(a.data(), qa.data(), n);
+        quantize_row_q8_0_ref(b.data(), qb.data(), n);
+
+        float ref = 0.0f;
+        for (int i = 0; i < nb; i++) {
+            int sumi = 0;
+            for (int j = 0; j < 32; j++) {
+                sumi += (int) qa[i].qs[j] * (int) qb[i].qs[j];
+            }
+            ref += (float) sumi * (ggml_fp16_to_fp32(qa[i].d) * ggml_fp16_to_fp32(qb[i].d));
+        }
+
+        float result = 0.0f;
+        ggml_vec_dot_q8_0_q8_0(n, &result, 0, qa.data(), 0, qb.data(), 0, 1);
+
+        const float err = fabsf(result - ref) / std::max(1.0f, fabsf(ref));
+        const bool failed = !(err < 1e-5f);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("%5s vec_dot n=%3d (%3s nb): %s (ref=%f got=%f err=%g)\n",
+                   ggml_type_name(GGML_TYPE_Q8_0), n, nb % 2 ? "odd" : "even", RESULT_STR[failed], ref, result, err);
+        }
+    }
+
+    return num_failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -390,7 +710,9 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_vec_dot_q8_0_q8_0(verbose);
     num_failed += test_dequantize_q(verbose);
+    num_failed += test_quantize_q(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);
 
     if (num_failed || verbose) {

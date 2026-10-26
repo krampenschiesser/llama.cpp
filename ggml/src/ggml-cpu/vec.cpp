@@ -552,11 +552,35 @@ ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const floa
 // TODO: optimize to process the remaining elements in groups using the smaller vector sizes from AVX2 and SSE
 // ref: https://github.com/ggml-org/llama.cpp/pull/15953#pullrequestreview-3310928344
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
+    const __m512 vmean = _mm512_set1_ps(mean);
+
+    for (; i + 63 < n; i += 64) {
+        const __m512 d0 = _mm512_sub_ps(_mm512_loadu_ps(x + i +  0), vmean);
+        const __m512 d1 = _mm512_sub_ps(_mm512_loadu_ps(x + i + 16), vmean);
+        const __m512 d2 = _mm512_sub_ps(_mm512_loadu_ps(x + i + 32), vmean);
+        const __m512 d3 = _mm512_sub_ps(_mm512_loadu_ps(x + i + 48), vmean);
+
+        _mm512_storeu_ps(y + i +  0, d0);
+        _mm512_storeu_ps(y + i + 16, d1);
+        _mm512_storeu_ps(y + i + 32, d2);
+        _mm512_storeu_ps(y + i + 48, d3);
+
+        // one horizontal reduce per 64 elements
+        const __m512 sq01 = _mm512_add_ps(_mm512_mul_ps(d0, d0), _mm512_mul_ps(d1, d1));
+        const __m512 sq23 = _mm512_add_ps(_mm512_mul_ps(d2, d2), _mm512_mul_ps(d3, d3));
+        sum += (ggml_float)_mm512_reduce_add_ps(_mm512_add_ps(sq01, sq23));
+    }
     for (; i + 15 < n; i += 16) {
-        __m512 val = _mm512_sub_ps(_mm512_loadu_ps(x + i),
-                                   _mm512_set1_ps(mean));
+        const __m512 val = _mm512_sub_ps(_mm512_loadu_ps(x + i), vmean);
         _mm512_storeu_ps(y + i, val);
         sum += (ggml_float)_mm512_reduce_add_ps(_mm512_mul_ps(val, val));
+    }
+    if (i < n) {
+        const __mmask16 mask = (__mmask16) ((1u << (n - i)) - 1);
+        const __m512 val = _mm512_sub_ps(_mm512_maskz_loadu_ps(mask, x + i), vmean);
+        _mm512_mask_storeu_ps(y + i, mask, val);
+        sum += (ggml_float)_mm512_mask_reduce_add_ps(mask, _mm512_mul_ps(val, val));
+        i = n;
     }
 #elif defined(__AVX2__) && defined(__FMA__)
     for (; i + 7 < n; i += 8) {
@@ -626,11 +650,33 @@ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float 
     int i = 0;
     ggml_float sum = 0;
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
+    const __m512 vmax = _mm512_set1_ps(max);
+
+    for (; i + 63 < n; i += 64) {
+        const __m512 v0 = ggml_v_expf(_mm512_sub_ps(_mm512_loadu_ps(x + i +  0), vmax));
+        const __m512 v1 = ggml_v_expf(_mm512_sub_ps(_mm512_loadu_ps(x + i + 16), vmax));
+        const __m512 v2 = ggml_v_expf(_mm512_sub_ps(_mm512_loadu_ps(x + i + 32), vmax));
+        const __m512 v3 = ggml_v_expf(_mm512_sub_ps(_mm512_loadu_ps(x + i + 48), vmax));
+
+        _mm512_storeu_ps(y + i +  0, v0);
+        _mm512_storeu_ps(y + i + 16, v1);
+        _mm512_storeu_ps(y + i + 32, v2);
+        _mm512_storeu_ps(y + i + 48, v3);
+
+        // one horizontal reduce per 64 elements, keeps the double accumulation as accurate as the 8-wide paths
+        sum += (ggml_float)_mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(v0, v1), _mm512_add_ps(v2, v3)));
+    }
     for (; i + 15 < n; i += 16) {
-        __m512 val = ggml_v_expf(_mm512_sub_ps(_mm512_loadu_ps(x + i),
-                                               _mm512_set1_ps(max)));
+        const __m512 val = ggml_v_expf(_mm512_sub_ps(_mm512_loadu_ps(x + i), vmax));
         _mm512_storeu_ps(y + i, val);
         sum += (ggml_float)_mm512_reduce_add_ps(val);
+    }
+    if (i < n) {
+        const __mmask16 mask = (__mmask16) ((1u << (n - i)) - 1);
+        const __m512 val = ggml_v_expf(_mm512_sub_ps(_mm512_maskz_loadu_ps(mask, x + i), vmax));
+        _mm512_mask_storeu_ps(y + i, mask, val);
+        sum += (ggml_float)_mm512_mask_reduce_add_ps(mask, val);
+        i = n;
     }
 #elif defined(__AVX2__) && defined(__FMA__)
     for (; i + 7 < n; i += 8) {

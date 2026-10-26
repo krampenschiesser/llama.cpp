@@ -446,6 +446,7 @@ function(ggml_add_cpu_backend_variant tag_name)
                       SSE42
                       AVX AVX2 BMI2 AVX_VNNI FMA F16C
                       AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16
+                      AVX512_VBMI2 AVX512_BITALG AVX512_VPOPCNTDQ AVX512_IFMA GFNI
                       AMX_TILE AMX_INT8 AMX_BF16)
             set(GGML_${feat} OFF)
         endforeach()
@@ -512,7 +513,7 @@ if (GGML_CPU_ALL_VARIANTS)
             # https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64?view=msvc-170
             ggml_add_cpu_backend_variant(cooperlake     SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VNNI AVX512_BF16)
             ggml_add_cpu_backend_variant(zen4           SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16)
-            ggml_add_cpu_backend_variant(epyc9005       SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512F AVX512DQ AVX512IFMA AVX512CD AVX512BW AVX512VL AVX512_VBMI AVX512_VBMI2 AVX512_VNNI AVX512_BF16)
+            ggml_add_cpu_backend_variant(epyc9005       SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512F AVX512DQ AVX512_IFMA AVX512CD AVX512BW AVX512VL AVX512_VBMI AVX512_VBMI2 AVX512_VNNI AVX512_BF16 AVX512_BITALG AVX512_VPOPCNTDQ GFNI)
         endif()
         ggml_add_cpu_backend_variant(alderlake          SSE42 AVX F16C FMA AVX2 BMI2 AVX_VNNI)
         if (NOT MSVC)
