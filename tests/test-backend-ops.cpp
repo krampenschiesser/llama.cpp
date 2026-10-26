@@ -2798,11 +2798,11 @@ struct test_rope_set_rows : public test_case {
     const ggml_type type_idx;
     const std::array<int64_t, 4> ne_a;
     int mode;
+    const int n_dims;
     const int n_ctx{512};
-    const int n_dims{128};
 
     std::string vars() override {
-        return VARS_TO_STR4(type, type_idx, ne_a, mode);
+        return VARS_TO_STR5(type, type_idx, ne_a, mode, n_dims);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -2815,8 +2815,9 @@ struct test_rope_set_rows : public test_case {
     test_rope_set_rows(ggml_type type,
             ggml_type type_idx,
             std::array<int64_t, 4> ne_a,
-            int mode)
-        : type(type), type_idx(type_idx), ne_a(ne_a), mode(mode) {}
+            int mode,
+            int n_dims = 128)
+        : type(type), type_idx(type_idx), ne_a(ne_a), mode(mode), n_dims(n_dims) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne_a[0], ne_a[1], ne_a[2], 1);
@@ -2850,7 +2851,7 @@ struct test_rope_set_rows : public test_case {
                 rope = ggml_rope_multi(ctx, a, pos, freq, n_dims, rope_sections, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
             }
         } else {
-            rope = ggml_rope(ctx, a, pos, ne_a[0], mode);
+            rope = ggml_rope(ctx, a, pos, n_dims, mode);
         }
 
         ggml_tensor * view = ggml_view_2d(ctx, rope, ne_a[0] * ne_a[1], ne_a[2], rope->nb[2], 0);
@@ -9995,6 +9996,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::default_random_engine rng(0);
 
     // unary ops
+    // TODO: add GGML_UNARY_OP_SOFTPLUS test that is sensitive to using `log1p(exp(x))` vs `log(exp(x) + 1)`
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_UNARY_OP_COUNT; op++) {
@@ -10233,6 +10235,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_rope_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, { 128, 32, 8, 1 }, GGML_ROPE_TYPE_IMROPE));
+    // partial rotation
+    for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE }) {
+        for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+            test_cases.emplace_back(new test_rope_set_rows(type, GGML_TYPE_I64, { 256, 4, 8, 1 }, mode, 64));
+        }
+    }
 
     for (ggml_type type_input : {GGML_TYPE_F32}) {
         for (ggml_op_pool pool_type : {GGML_OP_POOL_AVG, GGML_OP_POOL_MAX}) {
@@ -10493,6 +10501,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     };
 
     for (ggml_type kernel_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_conv_3d(1, 4, 6, 78, 54, 512, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
+        test_cases.emplace_back(new test_conv_3d(2, 16, 4, 64, 64, 256, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, kernel_type));
         for (int N : {1, 2}) {
             for (int IC : {1, 3}) {
                 for (int OC : {1, 4}) {
@@ -11073,6 +11083,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+
+#if 0
+    // > 2^31-element dst (8.9 GB), about 45 GB peak memory. Too large to be enabled by default.
+    // kernel_mul_mm dst offset of the last batch is past INT32_MAX: rows 0-31 use full tiles, rows 32-39 use edge tiles.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1048576, 40, 64, {1, 1}, {53, 1}));
+
+    // kernel_mul_mm_id: the index of tokens 32768-33791 does not fit in 16 bits (about 0.3 GB peak memory).
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 64, 33792, 64));
+    // kernel_mul_mm_id: > 2^31-element dst (8.7 GB), about 45 GB peak memory. Tokens 32514+ have a dst offset past INT32_MAX, tokens 32768+ also need a 32-bit token index.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 16, 8, false, 8256, 32832, 64));
+#endif
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
@@ -12360,6 +12381,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    // Fused gate/up + GLU on the MMQ path, only used if its tiling is efficient: ~1280 tiles per case, one case per type and GLU op.
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,        17, 81920, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q5_K,   GGML_GLU_OP_GEGLU,        150, 40960, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K,   GGML_GLU_OP_SWIGLU_OAI,   150, 40960, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0,   GGML_GLU_OP_SWIGLU_CLAMP, 150,  6912, 256, false, 1, 1, false, false, true, false, { 2, 3 }));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ4_XS, GGML_GLU_OP_SWIGLU,       150, 40960, 512, false, 1, 1, false, false, true, false, { 1, 1 }));
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
@@ -12597,6 +12625,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         {1,  320, 8,  76,  52, 1280, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1},
         {1, 1280, 8,  76,  52, 1280, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1},
         {1,  320, 8, 152, 104, 1280, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+        // Wan VAE pads spatial borders and temporal history before conv3d; operator padding is zero.
+        {1,  384, 3,  40,  28,  384, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1},
+        {1,  192, 4,  78,  54,  192, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1},
+        {1,   96, 6, 154, 106,   96, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1},
+        {1,   96, 6, 306, 210,    3, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1},
+        {1, 1024, 3,  40,  28, 1024, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1},
+        {1,  256, 6, 154, 106,  256, 3, 3, 3, 1, 1, 1, 0, 0, 0, 1, 1, 1},
+        {1,  384, 3,  38,  26,  768, 3, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1},
+        {1,  192, 2,  76,  52,   96, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1},
 #if 0
         // too slow on some devices
         {1, 1280, 8, 152, 104, 1280, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1},
