@@ -356,6 +356,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // device cache in bytes for the MoE experts kept in the CPU and stored in the CPU repack buffer, 0 = disabled [EXPERIMENTAL]
+        size_t moe_cache_size;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -405,7 +408,7 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
-        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        size_t moe_cache_size; // device cache in bytes for the MoE experts kept in the CPU: the most used experts are copied to the device cache when the device is idle, the misses are computed on the CPU, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -1140,6 +1143,11 @@ extern "C" {
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+
+    // Apply the MoE cache usage counters and move the most used experts to the device cache.
+    // Call only when no work is in flight, e.g. when all inference slots are idle or released.
+    // No-op if the model has no MoE cache. [EXPERIMENTAL]
+    LLAMA_API void llama_moe_cache_rebalance(struct llama_context * ctx);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously

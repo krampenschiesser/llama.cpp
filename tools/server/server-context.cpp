@@ -1523,6 +1523,25 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                // when the last active slot is released no work is in flight: apply the MoE cache
+                // usage counters of the task that just finished and promote its most used experts
+                bool all_idle = true;
+                for (const auto & slot : slots) {
+                    if (slot.is_processing() && !slot.audio_wait) {
+                        all_idle = false;
+                        break;
+                    }
+                }
+                if (!all_idle) {
+                    return;
+                }
+                if (ctx_tgt != nullptr) {
+                    llama_moe_cache_rebalance(ctx_tgt);
+                }
+                if (ctx_dft != nullptr) {
+                    llama_moe_cache_rebalance(ctx_dft);
+                }
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {

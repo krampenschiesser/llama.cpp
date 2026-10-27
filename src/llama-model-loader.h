@@ -129,6 +129,9 @@ struct llama_model_loader {
     void * set_tensor_data_ud;
     std::vector<ggml_context_ptr> contexts;
 
+    // routed experts go to the CPU repack buffer when the MoE cache is enabled
+    size_t moe_cache_size = 0;
+
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
 
@@ -179,7 +182,8 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        size_t moe_cache_size = 0);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

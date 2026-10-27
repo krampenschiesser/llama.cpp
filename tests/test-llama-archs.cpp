@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
@@ -704,6 +705,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
+    model_params.moe_cache_size = moe_cache_size;
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -716,6 +718,13 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         // the MoE cache is only used for small ubatches
         ctx_params.moe_cache_size = moe_cache_size;
         ctx_params.n_ubatch = 2;
+        // LLAMA_TEST_MOE_CACHE_UBATCH runs the cache tests with a prompt-processing-like ubatch
+        const char * env_ubatch = getenv("LLAMA_TEST_MOE_CACHE_UBATCH");
+        if (env_ubatch != nullptr && atoi(env_ubatch) > 0) {
+            ctx_params.n_ubatch = (uint32_t) atoi(env_ubatch);
+            // room for the causal-attention toggle check, it decodes 1.5 ubatches after the 128 tokens
+            ctx_params.n_ctx = 512;
+        }
     }
 
     tensor_data_params tensor_params = { seed, stdev };
@@ -1131,17 +1140,36 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         }
 
         // the ops that use the host experts run on a GPU and read the experts from a cache
-        // the cache has only a few slots (4 for 288 KiB experts), so the experts are evicted and uploaded again
+        // the budget is partial: the experts that are not in the cache are computed on the CPU
         if (!devices_meta.empty()) {
             const enum ggml_backend_dev_type type = ggml_backend_dev_type(devices_meta[0]);
             if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE cache", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
+                const size_t moe_cache_size = 16*1024*1024;
+                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE cache", LLAMA_SPLIT_MODE_LAYER, true, moe_cache_size);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
                 // each GPU caches the layers assigned to it
                 if (devices_meta.size() > 1) {
-                    dev_configs.emplace_back(devices_meta, "MoE cache, layer split", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
+                    dev_configs.emplace_back(devices_meta, "MoE cache, layer split", LLAMA_SPLIT_MODE_LAYER, true, moe_cache_size);
                     max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
                 }
+            }
+        }
+
+        // the CPU backend is the cache device, for tests on machines without a GPU
+        // the cache still needs the experts in host memory and a budget that holds the zero slots too
+        const char * env_moe_cache_cpu = getenv("LLAMA_TEST_MOE_CACHE_CPU");
+        if (target_backend == nullptr && env_moe_cache_cpu != nullptr && strcmp(env_moe_cache_cpu, "0") != 0) {
+            if (getenv("LLAMA_MOE_CACHE_CPU_DEVICE") == nullptr) {
+                LOG_WRN("%s: LLAMA_TEST_MOE_CACHE_CPU is set but LLAMA_MOE_CACHE_CPU_DEVICE is not, skipping the CPU MoE cache test\n", __func__);
+            } else {
+                // a partial budget caches only part of the experts, so that the misses are computed on the CPU
+                size_t moe_cache_mib = 8;
+                const char * env_moe_cache_mib = getenv("LLAMA_TEST_MOE_CACHE_CPU_MIB");
+                if (env_moe_cache_mib != nullptr && atoi(env_moe_cache_mib) > 0) {
+                    moe_cache_mib = atoi(env_moe_cache_mib);
+                }
+                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{}, "MoE cache CPU", LLAMA_SPLIT_MODE_LAYER, true, moe_cache_mib*1024*1024);
+                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
             }
         }
     }

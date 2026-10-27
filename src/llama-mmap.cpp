@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <climits>
+#include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
 #include <cerrno>
@@ -170,6 +171,12 @@ struct llama_file::impl {
         uint32_t val;
         read_raw(&val, sizeof(val));
         return val;
+    }
+
+    void read_at_direct(size_t offset, void * ptr, size_t len, void * stage, size_t stage_len) const {
+        (void) stage;
+        (void) stage_len;
+        read_at(offset, ptr, len);
     }
 
     void write_raw(const void * ptr, size_t len) const {
@@ -410,6 +417,47 @@ struct llama_file::impl {
         }
     }
 
+    void read_at_direct(size_t offset, void * ptr, size_t len, void * stage, size_t stage_len) const {
+        GGML_ASSERT(has_direct_io());
+        GGML_ASSERT(stage != nullptr);
+        GGML_ASSERT((reinterpret_cast<uintptr_t>(stage) & (alignment - 1)) == 0);
+
+        const size_t start = offset & ~(alignment - 1);
+        const size_t end = offset + len;
+        const size_t aligned_end = (end + alignment - 1) & ~(alignment - 1);
+        const size_t read_len = aligned_end - start;
+
+        if (read_len > stage_len) {
+            throw std::runtime_error(format("direct read range %zu exceeds stage size %zu", read_len, stage_len));
+        }
+
+        std::memset(stage, 0, read_len);
+
+        const size_t expected = start < size ? std::min(aligned_end, size) - start : 0;
+
+        size_t bytes_read = 0;
+        while (bytes_read < read_len) {
+            const ssize_t ret = ::pread(fd, reinterpret_cast<char *>(stage) + bytes_read,
+                                        read_len - bytes_read, (off_t) (start + bytes_read));
+            if (ret < 0 && errno == EINTR) {
+                continue;
+            }
+            if (ret < 0) {
+                throw std::runtime_error(format("direct read error at offset %zu: %s", start + bytes_read, strerror(errno)));
+            }
+            if (ret == 0) {
+                break;
+            }
+            bytes_read += (size_t) ret;
+        }
+
+        if (bytes_read < expected) {
+            throw std::runtime_error(format("direct read error at offset %zu: unexpectedly reached end of file", start + bytes_read));
+        }
+
+        std::memcpy(ptr, reinterpret_cast<const char *>(stage) + (offset - start), len);
+    }
+
     void write_raw(const void * ptr, size_t len) const {
         if (len == 0) {
             return;
@@ -468,6 +516,7 @@ bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
 const std::string & llama_file::name() const { return pimpl->fname; }
 
 void llama_file::read_at(size_t offset, void * dst, size_t len) const { pimpl->read_at(offset, dst, len); }
+void llama_file::read_at_direct(size_t offset, void * dst, size_t len, void * stage, size_t stage_len) const { pimpl->read_at_direct(offset, dst, len, stage, stage_len); }
 
 int llama_file::file_id() const {
 #ifdef _WIN32

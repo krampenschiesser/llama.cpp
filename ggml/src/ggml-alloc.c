@@ -464,6 +464,15 @@ struct hash_node {
     bool allocated;
 };
 
+// debug: report why the allocator cannot reuse a reservation, the env variable can be removed
+static bool ggml_gallocr_debug_realloc(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("GGML_GALLOC_DEBUG_REALLOC") != NULL ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 struct tensor_alloc {
     int buffer_id;
     struct buffer_address addr;
@@ -994,14 +1003,21 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
     }
 }
 
-static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
+static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc, const char * what) {
     size_t node_size = 0;
     if (!node->data && !node->view_src) {
         // If we previously had data but don't now then reallocate
         if (talloc->buffer_id < 0) {
+            if (ggml_gallocr_debug_realloc()) {
+                GGML_LOG_INFO("%s: %s tensor %s had data in the reservation but not now\n", __func__, what, node->name);
+            }
             return false;
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
+    }
+    if (talloc->size_max < node_size && ggml_gallocr_debug_realloc()) {
+        GGML_LOG_INFO("%s: %s tensor %s does not fit: needs %zu bytes, reserved %zu bytes\n",
+            __func__, what, node->name, node_size, talloc->size_max);
     }
     return talloc->size_max >= node_size;
 }
@@ -1011,6 +1027,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 #endif
+        if (ggml_gallocr_debug_realloc()) {
+            GGML_LOG_INFO("%s: graph has %d nodes, reservation has %d\n", __func__, graph->n_nodes, galloc->n_nodes);
+        }
         return true;
     }
 
@@ -1018,6 +1037,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
+        if (ggml_gallocr_debug_realloc()) {
+            GGML_LOG_INFO("%s: graph has %d leafs, reservation has %d\n", __func__, graph->n_leafs, galloc->n_leafs);
+        }
         return true;
     }
 
@@ -1025,7 +1047,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
-        if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
+        if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst, "dst")) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
 #endif
@@ -1037,7 +1059,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
             if (src == NULL) {
                 continue;
             }
-            if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
+            if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j], "src")) {
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif

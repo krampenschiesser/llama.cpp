@@ -34,6 +34,9 @@ struct llama_file {
     // positional read, bypassing any buffering; not thread-safe and not valid on a direct I/O file
     void read_at(size_t offset, void * dst, size_t len) const;
 
+    // positional read for a direct I/O file: stage must be aligned, stage_len is its usable size
+    void read_at_direct(size_t offset, void * dst, size_t len, void * stage, size_t stage_len) const;
+
     void seek(size_t offset, int whence) const;
 
     void read_raw(void * ptr, size_t len);

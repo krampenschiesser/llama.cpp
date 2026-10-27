@@ -544,8 +544,9 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        size_t moe_cache_size)
+        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud), moe_cache_size(moe_cache_size) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -1087,6 +1088,19 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+// the routed experts of a MoE layer: the tensors the MoE cache can read from the plain file
+static bool is_routed_expert(enum llm_tensor tensor) {
+    switch (tensor) {
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_UP_EXPS:
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:
+            return true;
+        default:
+            return false;
+    }
+}
+
 ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
@@ -1248,7 +1262,24 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        if (moe_cache_size > 0 && is_routed_expert(tn.tensor)) {
+                            // the MoE cache reads the plain data at runtime, so keep the experts out of the host buffers
+                            buft_list_t buft_list_cpu_no_host;
+                            for (const auto & cur : *buft_list_cpu) {
+                                if (cur.second != ggml_backend_dev_host_buffer_type(cur.first)) {
+                                    buft_list_cpu_no_host.push_back(cur);
+                                }
+                            }
+                            if (!buft_list_cpu_no_host.empty()) {
+                                buft = select_weight_buft(hparams, t_meta, op, &buft_list_cpu_no_host);
+                                if (!buft) {
+                                    // the plain CPU buffer is the last entry
+                                    buft = buft_list_cpu_no_host.back().second;
+                                }
+                            }
+                        } else {
+                            buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        }
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {

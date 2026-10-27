@@ -911,6 +911,11 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // plain GGUF source of the expert tensors stored in the CPU repack buffer
+    bool has_plain_source(const struct ggml_tensor * t) const;
+    size_t plain_source_alignment() const;
+    bool read_plain_source(const struct ggml_tensor * t, size_t offs, size_t size, void * dst, void * stage, size_t stage_len) const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;

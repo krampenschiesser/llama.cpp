@@ -1434,6 +1434,15 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    // plain GGUF source of the expert tensors in the CPU repack buffer
+    struct plain_src {
+        uint16_t file_idx;
+        size_t   offs;
+    };
+
+    std::unordered_map<const ggml_tensor *, plain_src> plain_srcs;
+    llama_files plain_files;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -2169,6 +2178,47 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
     }
 
+    // record the plain GGUF source of the expert tensors in the CPU repack buffer,
+    // the MoE cache reads them from the file at runtime
+    {
+        for (const auto & layer : layers) {
+            for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+                if (t == nullptr || t->buffer == nullptr) {
+                    continue;
+                }
+                if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    continue;
+                }
+                if (ggml_backend_buffer_is_host(t->buffer)) {
+                    continue;
+                }
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+                if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    continue;
+                }
+                const auto * w = ml.get_weight(ggml_get_name(t));
+                if (w == nullptr || w->idx >= ml.files.size()) {
+                    continue;
+                }
+                const auto & file = ml.files[w->idx];
+                if (file->name() == "(file*)") {
+                    continue;
+                }
+                // one expert is a contiguous block, the cache reads whole experts
+                if (t->ne[2] <= 0 || t->nb[2] == 0 || ggml_nbytes(t) != (size_t) t->ne[2] * t->nb[2]) {
+                    continue;
+                }
+                if (w->offs + ggml_nbytes(t) > file->size()) {
+                    continue;
+                }
+                pimpl->plain_srcs.emplace(t, llama_model::impl::plain_src{ w->idx, w->offs });
+            }
+        }
+        if (!pimpl->plain_srcs.empty()) {
+            LLAMA_LOG_INFO("%s: recorded %zu expert tensors with a plain file source\n", __func__, pimpl->plain_srcs.size());
+        }
+    }
+
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
@@ -2194,6 +2244,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.no_alloc) {
+        if (!pimpl->plain_srcs.empty()) {
+            pimpl->plain_files = std::move(ml.files);
+        }
         return true;
     }
 
@@ -2219,6 +2272,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    // the MoE cache reads the plain expert data at runtime, so the file handles must stay alive
+    if (!pimpl->plain_srcs.empty()) {
+        pimpl->plain_files = std::move(ml.files);
+    }
 
     return true;
 }
@@ -2943,6 +3001,45 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+bool llama_model::has_plain_source(const ggml_tensor * t) const {
+    const auto it = pimpl->plain_srcs.find(t);
+    return it != pimpl->plain_srcs.end() && it->second.file_idx < pimpl->plain_files.size();
+}
+
+size_t llama_model::plain_source_alignment() const {
+    size_t alignment = 1;
+    for (const auto & file : pimpl->plain_files) {
+        alignment = std::max(alignment, file->read_alignment());
+    }
+    return alignment;
+}
+
+bool llama_model::read_plain_source(const ggml_tensor * t, size_t offs, size_t size, void * dst, void * stage, size_t stage_len) const {
+    const auto it = pimpl->plain_srcs.find(t);
+    if (it == pimpl->plain_srcs.end() || it->second.file_idx >= pimpl->plain_files.size()) {
+        return false;
+    }
+
+    const size_t nbytes = ggml_nbytes(t);
+    if (offs > nbytes || size > nbytes - offs) {
+        return false;
+    }
+
+    const auto & src = it->second;
+    const auto * file = pimpl->plain_files[src.file_idx].get();
+    // only a file opened with an alignment needs a staged read, e.g. O_DIRECT
+    if (file->read_alignment() > 1) {
+        if (stage == nullptr || stage_len == 0) {
+            return false;
+        }
+        file->read_at_direct(src.offs + offs, dst, size, stage, stage_len);
+    } else {
+        file->read_at(src.offs + offs, dst, size);
+    }
+
+    return true;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -3569,6 +3666,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.moe_cache_size              =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

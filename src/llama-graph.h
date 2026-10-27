@@ -1042,6 +1042,12 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// the ids that select the experts of a MoE layer in the MoE cache
+struct llm_graph_moe_cache_slots {
+    ggml_tensor * slots;   // [n_expert_used, n_tokens] bank row of the cached experts, n_cached_experts_per_layer + k for the misses
+    ggml_tensor * cpu_ids; // [n_expert_used, n_tokens] expert id of the misses, -1 for the cached experts
+};
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -1140,13 +1146,14 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
-    // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
+    // if slots is set, the experts are selected by slots: from the MoE cache if cached, from w otherwise (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * w_s    = nullptr,
+              ggml_tensor * slots  = nullptr,
+                     bool   cached = true) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range
@@ -1252,8 +1259,9 @@ struct llm_graph_context {
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
 
-    // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
-    ggml_tensor * build_moe_cache_slots(
+    // the ids that select the experts of the layer in the MoE cache, both nullptr if the experts of the
+    // layer are not read from the cache. the cached experts are computed on the device and the misses on the CPU
+    llm_graph_moe_cache_slots build_moe_cache_slots(
              ggml_tensor * selected_experts,
              ggml_tensor * up_exps,
              ggml_tensor * gate_exps,

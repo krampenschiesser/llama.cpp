@@ -889,6 +889,13 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+void llama_context::moe_cache_rebalance() {
+    // only when the master context exists and the cache is enabled
+    if (sched && moe_cache) {
+        moe_cache->rebalance();
+    }
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
@@ -2566,6 +2573,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    if (moe_cache) {
+        // the MoE cache builds the expert FFN of each cached layer twice plus the slot expression
+        res += 64u * model.hparams.n_layer_all;
+    }
+
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
@@ -2779,6 +2791,11 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    // complete the pending usage reads of the MoE cache and rebalance it while the device is idle
+    if (moe_cache) {
+        moe_cache->begin();
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -2844,28 +2861,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             last++;
         }
 
-        // the experts in the MoE cache are copied from device memory, the others are uploaded
-        int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
-            if (n == 0) {
-                e++;
-                continue;
-            }
-            if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
-            }
-            e   += n;
-            next = e;
-        }
-
         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = next*expert_size;
+        const size_t offset  = first*expert_size;
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        const size_t size    = (last + 1 - next)*expert_size + padding;
-        if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
-        }
+        const size_t size    = (last + 1 - first)*expert_size + padding;
+        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
 
         first = last + 1;
     }
@@ -4243,6 +4243,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+void llama_moe_cache_rebalance(llama_context * ctx) {
+    ctx->moe_cache_rebalance();
 }
 
 float * llama_get_logits(llama_context * ctx) {

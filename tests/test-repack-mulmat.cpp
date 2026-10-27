@@ -246,7 +246,7 @@ int main(void) {
     ggml_backend_buffer_type_t buft_repack = ggml_backend_cpu_repack_buffer_type();
 
     const ggml_type types[] = {
-        GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q2_K,
+        GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q2_K,
         GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_Q8_0,
     };
 
