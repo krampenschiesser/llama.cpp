@@ -69,6 +69,13 @@ struct block_mxfp4x8 {
     uint8_t qs[QK8_0 * 4];
 };
 
+// block_iq4_xsx8 from ggml/src/ggml-cpu/repack.h, 8 x 256 IQ4_XS quants, 6 bit scales
+struct block_iq4_xsx8 {
+    ggml_fp16_t d[8];
+    uint8_t     scales[48];
+    uint8_t     qs[QK_K * 4];
+};
+
 struct block_q8_0 {
     ggml_fp16_t d;
     int8_t      qs[QK8_0];
@@ -88,6 +95,7 @@ static_assert(sizeof(block_q8_Kx4) == 4 * sizeof(float) + QK_K * 4 + (QK_K / 4) 
 static_assert(sizeof(block_q4_0x8) == 8 * sizeof(ggml_fp16_t) + QK8_0 * 4, "wrong block_q4_0x8 size");
 static_assert(sizeof(block_iq4_nlx8) == 8 * sizeof(ggml_fp16_t) + QK8_0 * 4, "wrong block_iq4_nlx8 size");
 static_assert(sizeof(block_mxfp4x8) == 8 + QK8_0 * 4, "wrong block_mxfp4x8 size");
+static_assert(sizeof(block_iq4_xsx8) == 8 * sizeof(ggml_fp16_t) + 48 + QK_K * 4, "wrong block_iq4_xsx8 size");
 static_assert(sizeof(block_q8_0) == sizeof(ggml_fp16_t) + QK8_0, "wrong block_q8_0 size");
 static_assert(sizeof(block_q8_0x4) == 4 * sizeof(ggml_fp16_t) + QK8_0 * 4, "wrong block_q8_0x4 size");
 
@@ -113,12 +121,16 @@ void ggml_gemv_q4_0_8x8_q8_0(int n, float * s, size_t bs, const void * vx, const
 void ggml_gemv_q4_0_8x8_q8_0_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemv_iq4_nl_8x8_q8_0(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemv_iq4_nl_8x8_q8_0_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
+void ggml_gemv_iq4_xs_8x8_q8_K(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
+void ggml_gemv_iq4_xs_8x8_q8_K_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemv_mxfp4_8x8_q8_0(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemv_mxfp4_8x8_q8_0_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemm_q4_0_8x8_q8_0(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemm_q4_0_8x8_q8_0_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemm_iq4_nl_8x8_q8_0(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemm_iq4_nl_8x8_q8_0_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
+void ggml_gemm_iq4_xs_8x8_q8_K(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
+void ggml_gemm_iq4_xs_8x8_q8_K_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemm_mxfp4_8x8_q8_0(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void ggml_gemm_mxfp4_8x8_q8_0_generic(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 void quantize_row_q8_K_ref(const float * x, block_q8_K * y, int64_t k);
@@ -155,7 +167,14 @@ static void fill_packed(std::vector<block_t> & packed) {
         for (int j = 0; j < 8; ++j) {
             packed[i].d[j] = ggml_fp32_to_fp16(0.25f + rand_f32());
         }
-        if constexpr (std::is_same_v<block_t, block_q6_Kx8>) {
+        if constexpr (std::is_same_v<block_t, block_iq4_xsx8>) {
+            for (int j = 0; j < 48; ++j) {
+                packed[i].scales[j] = (uint8_t) (rand() & 0xFF);
+            }
+            for (int j = 0; j < QK_K * 4; ++j) {
+                packed[i].qs[j] = (uint8_t) (rand() & 0xFF);
+            }
+        } else if constexpr (std::is_same_v<block_t, block_q6_Kx8>) {
             for (int j = 0; j < QK_K / 16 * 8; ++j) {
                 packed[i].scales[j] = (int8_t) ((rand() % 9) - 4);
             }
@@ -494,6 +513,10 @@ int main(void) {
                 test_shape<block_q4_Kx8>(ggml_gemv_q4_K_8x8_q8_K, ggml_gemv_q4_K_8x8_q8_K_generic, ns[i], ncs[j], nr);
                 test_shape<block_q5_Kx8>(ggml_gemv_q5_K_8x8_q8_K, ggml_gemv_q5_K_8x8_q8_K_generic, ns[i], ncs[j], nr);
                 test_shape<block_q6_Kx8>(ggml_gemv_q6_K_8x8_q8_K, ggml_gemv_q6_K_8x8_q8_K_generic, ns[i], ncs[j], nr);
+                // the IQ4_XS kernels only exist in the x86 backend
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+                test_shape<block_iq4_xsx8>(ggml_gemv_iq4_xs_8x8_q8_K, ggml_gemv_iq4_xs_8x8_q8_K_generic, ns[i], ncs[j], nr);
+#endif
             }
         }
     }
@@ -522,6 +545,9 @@ int main(void) {
                 test_gemm_shape<block_q4_Kx8>(ggml_gemm_q4_K_8x8_q8_K, ggml_gemm_q4_K_8x8_q8_K_generic, ns[i], gemm_ncs[j], gemm_nrs[k]);
                 test_gemm_shape<block_q5_Kx8>(ggml_gemm_q5_K_8x8_q8_K, ggml_gemm_q5_K_8x8_q8_K_generic, ns[i], gemm_ncs[j], gemm_nrs[k]);
                 test_gemm_shape<block_q6_Kx8>(ggml_gemm_q6_K_8x8_q8_K, ggml_gemm_q6_K_8x8_q8_K_generic, ns[i], gemm_ncs[j], gemm_nrs[k]);
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+                test_gemm_shape<block_iq4_xsx8>(ggml_gemm_iq4_xs_8x8_q8_K, ggml_gemm_iq4_xs_8x8_q8_K_generic, ns[i], gemm_ncs[j], gemm_nrs[k]);
+#endif
             }
         }
     }

@@ -662,6 +662,21 @@ static inline __m256 gemv_q4_b32_8x8_col_scale(const block_tx8 * b) {
     }
 }
 
+#if defined(__AVX512F__)
+// E8M0 exponents of two interleaved block_mxfp4x8 as fp32: lanes 0..7 from b0, 8..15 from b1.
+// Bit math equivalent of ggml_e8m0_to_fp32_half, avoids sixteen table loads and a set_ps.
+static inline __m512 gemm_mxfp4_col_scale_16(const block_mxfp4x8 * b0, const block_mxfp4x8 * b1) {
+    int64_t e0, e1;
+    memcpy(&e0, b0->e, sizeof(e0));
+    memcpy(&e1, b1->e, sizeof(e1));
+    const __m512i x = _mm512_cvtepu8_epi32(_mm_set_epi64x(e1, e0));
+    const __m512i expo = _mm512_slli_epi32(_mm512_sub_epi32(x, _mm512_set1_epi32(1)), 23);
+    const __m512i subnormal = _mm512_sllv_epi32(_mm512_set1_epi32(0x00200000), x);   // x < 2: 2^-128, 2^-127
+    const __mmask16 is_subnormal = _mm512_cmplt_epi32_mask(x, _mm512_set1_epi32(2));
+    return _mm512_castsi512_ps(_mm512_mask_blend_epi32(is_subnormal, expo, subnormal));
+}
+#endif
+
 // GEMV for 8x blocks of 32 4-bit quants with a single scale factor per block
 template<typename block_tx8>
 static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc, __m256i signextendlut) {
@@ -963,24 +978,7 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                         std::is_same_v<block_tx8, block_iq4_nlx8>) {
                     col_scale_f32 = GGML_F32Cx8x2_LOAD(b_ptr_0[b].d, b_ptr_1[b].d);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
-                    //TODO: simd-ify
-                    col_scale_f32 = _mm512_set_ps(
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[0]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[0]));
+                    col_scale_f32 = gemm_mxfp4_col_scale_16(b_ptr_0 + b, b_ptr_1 + b);
                 }
 
                 // Process LHS in pairs of rows
@@ -1174,24 +1172,7 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                         std::is_same_v<block_tx8, block_iq4_nlx8>) {
                     col_scale_f32 = GGML_F32Cx8x2_LOAD(b_ptr_0[b].d, b_ptr_1[b].d);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
-                    //TODO: simd-ify
-                    col_scale_f32 = _mm512_set_ps(
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[0]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[0]));
+                    col_scale_f32 = gemm_mxfp4_col_scale_16(b_ptr_0 + b, b_ptr_1 + b);
                 }
 
                 // Load the four blocks of quantized values interleaved with each other in chunks of eight - A0,A1,A2,A3
@@ -2254,6 +2235,127 @@ void ggml_gemv_iq4_nl_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
 #endif
 
     ggml_gemv_iq4_nl_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+// decode the 8 six-bit ls values of a sub-block into int32 lanes, biased by -32
+static inline __m256i iq4_xs_ls_minus32(const block_iq4_xsx8 * b, int sb) {
+    uint64_t sc;
+    // sb == 7 reads 2 bytes past the scales, still inside the block
+    memcpy(&sc, b->scales + 6 * sb, sizeof(sc));
+    const __m512i shifts = _mm512_setr_epi64(0, 6, 12, 18, 24, 30, 36, 42);
+    const __m512i srl = _mm512_srlv_epi64(_mm512_set1_epi64((int64_t) sc), shifts);
+    return _mm256_sub_epi32(_mm512_cvtepi64_epi32(_mm512_and_si512(srl, _mm512_set1_epi64(0x3F))), _mm256_set1_epi32(32));
+}
+
+// 16 activation bytes of row m from the q8_Kx4 chunks at qs and qs + 32
+static inline __m512i iq4_xs_act16(const int8_t * qs, int m) {
+    const __m128i v = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *) (qs + 8 * m)),
+                                         _mm_loadl_epi64((const __m128i *) (qs + 32 + 8 * m)));
+    return _mm512_broadcast_i32x4(v);
+}
+#endif
+
+void ggml_gemv_iq4_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK_K;
+    const int nb = n / qk;
+    const int ncols_interleaved = 8;
+
+    assert(n % qk == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    // +128 biased codes let vpdpbusd take the weights as u8; the bias is a per sub-block scalar
+    const __m512i lut_u = _mm512_xor_si512(
+            _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) kvalues_iq4nl)),
+            _mm512_set1_epi8(-128));
+    const __m512i m4b = _mm512_set1_epi8(0x0F);
+    // one scale per column, repeated over the four dwords of the column lane
+    const __m512i dup0 = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    const __m512i dup1 = _mm512_setr_epi32(4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+    // after the in-lane reduction every fourth dword holds one column sum
+    const __m512i combine = _mm512_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    const block_iq4_xsx8 * b_ptr_start = (const block_iq4_xsx8 *) vx;
+    const block_q8_K     * a_ptr_start = (const block_q8_K     *) vy;
+
+    for (int64_t y = 0; y < nr; y++) {
+
+        const block_q8_K * a_ptr = a_ptr_start + (y * nb);
+
+        for (int64_t x = 0; x < nc / ncols_interleaved; x++) {
+
+            const block_iq4_xsx8 * b_ptr = b_ptr_start + (x * nb);
+
+            __m256 acc = _mm256_setzero_ps();
+
+            for (int64_t b = 0; b < nb; b++) {
+
+                // two blocks ahead covers the DRAM latency at one core's bandwidth
+                if (b + 2 < nb) {
+                    _mm_prefetch((const char *) (b_ptr + b + 2), _MM_HINT_T0);
+                }
+
+                const __m256 col_d = GGML_F32Cx8_LOAD(b_ptr[b].d);
+
+                __m512i sumi0 = _mm512_setzero_si512();
+                __m512i sumi1 = _mm512_setzero_si512();
+
+                for (int sb = 0; sb < qk / 32; sb++) {
+                    const uint8_t * qs = b_ptr[b].qs + 128 * sb;
+                    const int8_t  * a  = a_ptr[b].qs +  32 * sb;
+
+                    const __m512i qx0 = _mm512_loadu_si512((const __m512i *) qs);
+                    const __m512i qx1 = _mm512_loadu_si512((const __m512i *) (qs + 64));
+
+                    const __m512i w0_lo = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(qx0, m4b));
+                    const __m512i w0_hi = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(_mm512_srli_epi32(qx0, 4), m4b));
+                    const __m512i w1_lo = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(qx1, m4b));
+                    const __m512i w1_hi = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(_mm512_srli_epi32(qx1, 4), m4b));
+
+                    const __m512i a_lo = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) a));
+                    const __m512i a_hi = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) (a + 16)));
+
+                    __m512i p0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w0_lo, a_lo);
+                    p0 = _mm512_dpbusd_epi32(p0, w0_hi, a_hi);
+                    __m512i p1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w1_lo, a_lo);
+                    p1 = _mm512_dpbusd_epi32(p1, w1_hi, a_hi);
+
+                    // one dword lane per column carries the bias of the whole 32-wide sub-block
+                    const int bsum = a_ptr[b].bsums[2 * sb] + a_ptr[b].bsums[2 * sb + 1];
+                    const __m512i corr = _mm512_set1_epi32(128 * bsum);
+                    p0 = _mm512_mask_sub_epi32(p0, 0x1111, p0, corr);
+                    p1 = _mm512_mask_sub_epi32(p1, 0x1111, p1, corr);
+
+                    const __m256i ls = iq4_xs_ls_minus32(b_ptr + b, sb);
+                    const __m512i sc0 = _mm512_permutexvar_epi32(dup0, _mm512_zextsi256_si512(ls));
+                    const __m512i sc1 = _mm512_permutexvar_epi32(dup1, _mm512_zextsi256_si512(ls));
+
+                    sumi0 = _mm512_add_epi32(sumi0, _mm512_mullo_epi32(p0, sc0));
+                    sumi1 = _mm512_add_epi32(sumi1, _mm512_mullo_epi32(p1, sc1));
+                }
+
+                sumi0 = _mm512_add_epi32(sumi0, _mm512_shuffle_epi32(sumi0, (_MM_PERM_ENUM) 0x4E));
+                sumi0 = _mm512_add_epi32(sumi0, _mm512_shuffle_epi32(sumi0, (_MM_PERM_ENUM) 0xB1));
+                sumi1 = _mm512_add_epi32(sumi1, _mm512_shuffle_epi32(sumi1, (_MM_PERM_ENUM) 0x4E));
+                sumi1 = _mm512_add_epi32(sumi1, _mm512_shuffle_epi32(sumi1, (_MM_PERM_ENUM) 0xB1));
+
+                const __m256i sum8 = _mm512_castsi512_si256(_mm512_permutex2var_epi32(sumi0, combine, sumi1));
+
+                const __m256 d_a = _mm256_set1_ps(a_ptr[b].d);
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum8), _mm256_mul_ps(col_d, d_a), acc);
+            }
+
+            _mm256_storeu_ps(s + (y * nr + x * ncols_interleaved), acc);
+        }
+    }
+#else
+    ggml_gemv_iq4_xs_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+#endif
 }
 
 void ggml_gemv_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -3633,6 +3735,187 @@ void ggml_gemm_iq4_nl_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
 #endif // defined(__AVX2__) || defined(__AVX512F__)
 
     ggml_gemm_iq4_nl_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_iq4_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK_K;
+    const int nb = n / qk;
+    const int ncols_interleaved = 8;
+
+    assert(n % qk == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    const __m512i lut_u = _mm512_xor_si512(
+            _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) kvalues_iq4nl)),
+            _mm512_set1_epi8(-128));
+    const __m512i m4b = _mm512_set1_epi8(0x0F);
+    const __m512i dup0 = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    const __m512i dup1 = _mm512_setr_epi32(4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+    const __m512i combine = _mm512_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    const block_iq4_xsx8 * b_ptr_start = (const block_iq4_xsx8 *) vx;
+    const block_q8_Kx4   * a_ptr_start = (const block_q8_Kx4   *) vy;
+
+#if defined(__AVX512VBMI__)
+    // byte indices pick the 16 activation bytes of one row out of one 64-byte chunk pair
+    uint8_t act_idx[4][64];
+    for (int m = 0; m < 4; m++) {
+        for (int l = 0; l < 4; l++) {
+            for (int i = 0; i < 8; i++) {
+                act_idx[m][16 * l + i]     = (uint8_t) (8 * m + i);
+                act_idx[m][16 * l + 8 + i] = (uint8_t) (32 + 8 * m + i);
+            }
+        }
+    }
+#endif
+
+    // 64 rows per weight pass: each super-block is decoded once and used by up to
+    // sixteen 4-row subgroups, so prefill re-reads the weights nr/64 times
+    for (int64_t y = 0; y < nr; y += 64) {
+
+        const int nrows = (int) (nr - y < 64 ? nr - y : 64);
+        const int nblk  = (nrows + 3) / 4;
+
+        for (int64_t x = 0; x < nc / ncols_interleaved; x++) {
+
+            const block_iq4_xsx8 * b_ptr = b_ptr_start + (x * nb);
+
+            alignas(64) float acc[64][8];
+            for (int r = 0; r < 4 * nblk; r++) {
+                _mm256_storeu_ps(acc[r], _mm256_setzero_ps());
+            }
+
+            for (int64_t b = 0; b < nb; b++) {
+
+                if (b + 2 < nb) {
+                    _mm_prefetch((const char *) (b_ptr + b + 2), _MM_HINT_T0);
+                }
+
+                const __m256 col_d = GGML_F32Cx8_LOAD(b_ptr[b].d);
+
+                // scaled sub-block sums held until the whole super-block is done, so the
+                // horizontal reduction runs once per row instead of once per 64 elements
+                alignas(64) __m512i psum[64][2];
+                for (int r = 0; r < 4 * nblk; r++) {
+                    psum[r][0] = _mm512_setzero_si512();
+                    psum[r][1] = _mm512_setzero_si512();
+                }
+
+                for (int g = 0; g < qk / 64; g++) {
+
+                    const uint8_t * qs = b_ptr[b].qs + 256 * g;
+
+                    const __m512i q0 = _mm512_loadu_si512((const __m512i *) qs);
+                    const __m512i q1 = _mm512_loadu_si512((const __m512i *) (qs + 64));
+                    const __m512i q2 = _mm512_loadu_si512((const __m512i *) (qs + 128));
+                    const __m512i q3 = _mm512_loadu_si512((const __m512i *) (qs + 192));
+
+                    const __m512i we0_lo = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(q0, m4b));
+                    const __m512i we0_hi = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(_mm512_srli_epi32(q0, 4), m4b));
+                    const __m512i we1_lo = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(q1, m4b));
+                    const __m512i we1_hi = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(_mm512_srli_epi32(q1, 4), m4b));
+                    const __m512i wo0_lo = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(q2, m4b));
+                    const __m512i wo0_hi = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(_mm512_srli_epi32(q2, 4), m4b));
+                    const __m512i wo1_lo = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(q3, m4b));
+                    const __m512i wo1_hi = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(_mm512_srli_epi32(q3, 4), m4b));
+
+                    const __m256i lse = iq4_xs_ls_minus32(b_ptr + b, 2 * g);
+                    const __m256i lso = iq4_xs_ls_minus32(b_ptr + b, 2 * g + 1);
+                    const __m512i sce0 = _mm512_permutexvar_epi32(dup0, _mm512_zextsi256_si512(lse));
+                    const __m512i sce1 = _mm512_permutexvar_epi32(dup1, _mm512_zextsi256_si512(lse));
+                    const __m512i sco0 = _mm512_permutexvar_epi32(dup0, _mm512_zextsi256_si512(lso));
+                    const __m512i sco1 = _mm512_permutexvar_epi32(dup1, _mm512_zextsi256_si512(lso));
+
+                    for (int mb = 0; mb < nblk; mb++) {
+
+                        const block_q8_Kx4 * a_ptr = a_ptr_start + (y / 4 + mb) * nb;
+                        const int8_t  * aqs = a_ptr[b].qs + 256 * g;
+                        const int16_t * bsums = a_ptr[b].bsums + 16 * g;
+
+#if defined(__AVX512VBMI__)
+                        const __m512i axe0 = _mm512_loadu_si512((const __m512i *) aqs);
+                        const __m512i axe1 = _mm512_loadu_si512((const __m512i *) (aqs + 64));
+                        const __m512i axo0 = _mm512_loadu_si512((const __m512i *) (aqs + 128));
+                        const __m512i axo1 = _mm512_loadu_si512((const __m512i *) (aqs + 192));
+#endif
+
+                        for (int m = 0; m < 4; m++) {
+#if defined(__AVX512VBMI__)
+                            const __m512i idx  = _mm512_loadu_si512((const __m512i *) act_idx[m]);
+                            const __m512i ale = _mm512_permutexvar_epi8(idx, axe0);
+                            const __m512i ahe = _mm512_permutexvar_epi8(idx, axe1);
+                            const __m512i alo = _mm512_permutexvar_epi8(idx, axo0);
+                            const __m512i aho = _mm512_permutexvar_epi8(idx, axo1);
+#else
+                            const __m512i ale = iq4_xs_act16(aqs, m);
+                            const __m512i ahe = iq4_xs_act16(aqs + 64, m);
+                            const __m512i alo = iq4_xs_act16(aqs + 128, m);
+                            const __m512i aho = iq4_xs_act16(aqs + 192, m);
+#endif
+                            __m512i pe0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), we0_lo, ale);
+                            pe0 = _mm512_dpbusd_epi32(pe0, we0_hi, ahe);
+                            __m512i pe1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), we1_lo, ale);
+                            pe1 = _mm512_dpbusd_epi32(pe1, we1_hi, ahe);
+
+                            const int bsume = bsums[4 * m] + bsums[4 * m + 1];
+                            const __m512i corre = _mm512_set1_epi32(128 * bsume);
+                            pe0 = _mm512_mask_sub_epi32(pe0, 0x1111, pe0, corre);
+                            pe1 = _mm512_mask_sub_epi32(pe1, 0x1111, pe1, corre);
+
+                            __m512i isum0 = _mm512_mullo_epi32(pe0, sce0);
+                            __m512i isum1 = _mm512_mullo_epi32(pe1, sce1);
+
+                            __m512i po0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), wo0_lo, alo);
+                            po0 = _mm512_dpbusd_epi32(po0, wo0_hi, aho);
+                            __m512i po1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), wo1_lo, alo);
+                            po1 = _mm512_dpbusd_epi32(po1, wo1_hi, aho);
+
+                            const int bsumo = bsums[4 * m + 2] + bsums[4 * m + 3];
+                            const __m512i corro = _mm512_set1_epi32(128 * bsumo);
+                            po0 = _mm512_mask_sub_epi32(po0, 0x1111, po0, corro);
+                            po1 = _mm512_mask_sub_epi32(po1, 0x1111, po1, corro);
+
+                            isum0 = _mm512_add_epi32(isum0, _mm512_mullo_epi32(po0, sco0));
+                            isum1 = _mm512_add_epi32(isum1, _mm512_mullo_epi32(po1, sco1));
+
+                            const int r = 4 * mb + m;
+                            psum[r][0] = _mm512_add_epi32(psum[r][0], isum0);
+                            psum[r][1] = _mm512_add_epi32(psum[r][1], isum1);
+                        }
+                    }
+                }
+
+                for (int mb = 0; mb < nblk; mb++) {
+                    for (int m = 0; m < 4; m++) {
+                        const int r = 4 * mb + m;
+                        __m512i isum0 = psum[r][0];
+                        __m512i isum1 = psum[r][1];
+
+                        isum0 = _mm512_add_epi32(isum0, _mm512_shuffle_epi32(isum0, (_MM_PERM_ENUM) 0x4E));
+                        isum0 = _mm512_add_epi32(isum0, _mm512_shuffle_epi32(isum0, (_MM_PERM_ENUM) 0xB1));
+                        isum1 = _mm512_add_epi32(isum1, _mm512_shuffle_epi32(isum1, (_MM_PERM_ENUM) 0x4E));
+                        isum1 = _mm512_add_epi32(isum1, _mm512_shuffle_epi32(isum1, (_MM_PERM_ENUM) 0xB1));
+
+                        const __m256i sum8 = _mm512_castsi512_si256(_mm512_permutex2var_epi32(isum0, combine, isum1));
+                        const float d_a = a_ptr_start[(y / 4 + mb) * nb + b].d[m];
+                        const __m256 cd = _mm256_mul_ps(col_d, _mm256_set1_ps(d_a));
+                        _mm256_storeu_ps(acc[r], _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum8), cd, _mm256_loadu_ps(acc[r])));
+                    }
+                }
+            }
+
+            for (int r = 0; r < nrows; r++) {
+                _mm256_storeu_ps(s + (y + r) * bs + x * ncols_interleaved, _mm256_loadu_ps(acc[r]));
+            }
+        }
+    }
+#else
+    ggml_gemm_iq4_xs_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+#endif
 }
 
 void ggml_gemm_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
