@@ -1443,6 +1443,9 @@ struct llama_model::impl {
 
     std::unordered_map<const ggml_tensor *, plain_src> plain_srcs;
     llama_files plain_files;
+
+    // routed experts whose host copy is owned by the MoE cache
+    std::unordered_set<const ggml_tensor *> moe_deferred;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -2088,6 +2091,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             continue;
         }
 
+        // the MoE cache owns the host copy of the deferred experts: allocate no data for them
+        if (ctx_key.deferred) {
+            ggml_backend_buffer_ptr buf { ggml_backend_buft_alloc_buffer(buft, 0) };
+            if (!buf) {
+                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+            }
+            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::vector<ggml_backend_buffer_ptr> bufs;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                t->buffer = buf.get();
+                pimpl->moe_deferred.insert(t);
+            }
+            bufs.emplace_back(std::move(buf));
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+            continue;
+        }
+
         // check if it is possible to use buffer_from_host_ptr with this buffer type
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         if (!dev) {
@@ -2189,12 +2209,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                     continue;
                 }
-                if (ggml_backend_buffer_is_host(t->buffer)) {
+                const bool deferred = pimpl->moe_deferred.count(t) > 0;
+                if (ggml_backend_buffer_is_host(t->buffer) && !deferred) {
                     continue;
                 }
-                ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
-                if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    continue;
+                if (!deferred) {
+                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+                    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        continue;
+                    }
                 }
                 const auto * w = ml.get_weight(ggml_get_name(t));
                 if (w == nullptr || w->idx >= ml.files.size()) {
@@ -2999,6 +3022,14 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+bool llama_model::is_moe_expert_deferred(const ggml_tensor * t) const {
+    return pimpl->moe_deferred.count(t) > 0;
+}
+
+bool llama_model::has_deferred_moe_experts() const {
+    return !pimpl->moe_deferred.empty();
 }
 
 bool llama_model::has_plain_source(const ggml_tensor * t) const {

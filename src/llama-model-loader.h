@@ -132,6 +132,9 @@ struct llama_model_loader {
     // routed experts go to the CPU repack buffer when the MoE cache is enabled
     size_t moe_cache_size = 0;
 
+    // routed experts that the MoE cache owns: no host copy is loaded for them
+    std::set<std::string> moe_deferred;
+
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
 
@@ -146,16 +149,20 @@ struct llama_model_loader {
         }
     };
 
-    // lazy tensors need dedicated context
+    // lazy tensors need dedicated context, deferred MoE experts need a context without data
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        bool deferred;
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
+            }
+            if (lhs.deferred != rhs.deferred) {
+                return lhs.deferred < rhs.deferred;
             }
             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
         }

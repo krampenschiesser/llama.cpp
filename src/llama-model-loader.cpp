@@ -1140,10 +1140,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
-    bool is_lazy = false;
+    bool is_lazy     = false;
+    bool is_deferred = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, is_lazy, is_deferred };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1264,6 +1265,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         // when overriding to a CPU buffer, consider the extra buffer types
                         if (moe_cache_size > 0 && is_routed_expert(tn.tensor)) {
                             // the MoE cache reads the plain data at runtime, so keep the experts out of the host buffers
+                            // the cache owns the host copy, so the model does not allocate or load one
+                            // only when the plain source can be read later, e.g. not for a file pointer
+                            const auto * w = get_weight(tn.str().c_str());
+                            is_deferred = w != nullptr && w->idx < files.size() && files[w->idx]->name() != "(file*)";
                             buft_list_t buft_list_cpu_no_host;
                             for (const auto & cur : *buft_list_cpu) {
                                 if (cur.second != ggml_backend_dev_host_buffer_type(cur.first)) {
@@ -1420,6 +1425,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
 
+    if (is_deferred) {
+        moe_deferred.insert(ggml_get_name(tensor));
+    }
+
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
     } else {
@@ -1480,7 +1489,11 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     }
 
     // compute the total size of all tensors for progress reporting
+    // deferred MoE experts are not loaded, the MoE cache reads them on demand
     for (const auto & it : weights_map) {
+        if (moe_deferred.count(it.first) > 0) {
+            continue;
+        }
         size_data += ggml_nbytes(it.second.tensor);
     }
 }

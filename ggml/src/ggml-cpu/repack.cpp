@@ -5603,11 +5603,28 @@ static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_
 
 static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                        const void * data, size_t offset, size_t size) {
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(size == ggml_nbytes(tensor));
+    GGML_ASSERT(tensor->extra != nullptr);
 
     auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
-    auto OK            = tensor_traits->repack(tensor, data, size);
+    int OK             = 0;
+
+    if (offset == 0 && size == ggml_nbytes(tensor)) {
+        OK = tensor_traits->repack(tensor, data, size);
+    } else {
+        // a partial write must cover whole planes, one plane is one expert
+        const size_t nb_plane = tensor->nb[2];
+        GGML_ASSERT(size > 0);
+        GGML_ASSERT(offset % nb_plane == 0);
+        GGML_ASSERT(size % nb_plane == 0);
+        GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+
+        ggml_tensor tmp = *tensor;
+        tmp.data  = (char *) tensor->data + offset;
+        tmp.ne[2] = size / nb_plane;
+        tmp.ne[3] = 1;
+
+        OK = tensor_traits->repack(&tmp, data, size);
+    }
 
     GGML_ASSERT(OK == 0);
     GGML_UNUSED(buffer);

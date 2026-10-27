@@ -565,6 +565,9 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+        } else if (model.has_deferred_moe_experts()) {
+            // the model was loaded for the MoE cache and keeps no host copy of the experts
+            throw std::runtime_error("the model was loaded with a MoE cache, the context must enable it too (moe_cache_size)");
         }
 
         sched_reserve();

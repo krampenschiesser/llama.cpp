@@ -545,6 +545,10 @@ void llama_model_save_to_file(const struct llama_model * model, const char * pat
         LLAMA_LOG_ERROR("%s: saving a model with lazy tensors is not supported\n", __func__);
         return;
     }
+    if (model->has_deferred_moe_experts()) {
+        LLAMA_LOG_ERROR("%s: saving a model whose MoE experts are owned by the cache is not supported\n", __func__);
+        return;
+    }
     llama_model_saver ms(model);
     ms.add_kv_from_model();
     ms.add_tensors_from_model();

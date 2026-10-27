@@ -911,6 +911,10 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // routed experts whose host copy is owned by the MoE cache (no data in the model buffer)
+    bool is_moe_expert_deferred(const struct ggml_tensor * t) const;
+    bool has_deferred_moe_experts() const;
+
     // plain GGUF source of the expert tensors stored in the CPU repack buffer
     bool has_plain_source(const struct ggml_tensor * t) const;
     size_t plain_source_alignment() const;

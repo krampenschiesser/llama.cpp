@@ -1774,9 +1774,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
+    // the cache may own the host copy of the experts, the model tensors then hold no data
+    ggml_tensor * w_host = moe_cache ? moe_cache->get_host_experts(w) : nullptr;
     ggml_tensor * res = slots == nullptr ?
-        ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots);
+        ggml_mul_mat_id(ctx0, w_host ? w_host : w, cur_mm, ids) :
+        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : (w_host ? w_host : w), cur_mm, slots);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2595,8 +2597,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     ggml_tensor * experts = nullptr;
-    if (cache_slots.slots == nullptr) {
+    if (cache_slots.slots == nullptr && cache_slots.cpu_ids == nullptr) {
         experts = build_experts(cur, selected_experts, nullptr, true);
+    } else if (cache_slots.slots == nullptr) {
+        // the device part is not available, e.g. the warmup selects all experts: compute the misses on the CPU
+        experts = build_experts(cur, selected_experts, cache_slots.cpu_ids, false);
     } else {
         // the device computes the cached experts and the CPU the misses, each part reads the other as zero
         GGML_ASSERT(cache_slots.cpu_ids != nullptr);
@@ -2685,8 +2690,7 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
                  int   il) const {
     llm_graph_moe_cache_slots res = { nullptr, nullptr };
 
-    // llama4 applies the router weights before the FFN (weight_before_ffn)
-    if (moe_cache == nullptr || arch == LLM_ARCH_LLAMA4 || !loras->empty()) {
+    if (moe_cache == nullptr) {
         return res;
     }
 
@@ -2695,22 +2699,8 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         return res;
     }
 
-    // the warmup runs with all experts selected and the misses would not fit in the zero slots
-    if (selected_experts->ne[1] == 0 || selected_experts->ne[0] > layer->n_zero) {
-        return res;
-    }
-    for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
-        if (w == nullptr) {
-            continue;
-        }
-        if (moe_cache->get_experts(w) == nullptr) {
-            return res;
-        }
-        // the transform of a Hadamard-folded weight reads host weights before the slot lookup starts its split
-        if (hdmd != nullptr && hdmd->rot.count(w) > 0) {
-            return res;
-        }
-    }
+    // the cache owns the host copy of these experts and keeps there only the misses
+    const bool reduced = layer->n_host < layer->n_expert;
 
     const int64_t n_used   = selected_experts->ne[0];
     const int64_t n_tokens = selected_experts->ne[1];
@@ -2721,6 +2711,47 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         ids = ggml_cont(ctx0, ids);
     }
     ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
+
+    // the host row of the misses computed on the CPU, -1 for the experts computed on the device
+    auto build_cpu_ids = [&]() -> llm_graph_moe_cache_slots {
+        GGML_ASSERT(layer->cpu_map != nullptr);
+        ggml_tensor * cpu_ids = ggml_get_rows(ctx0, layer->cpu_map, ids); // I32 [1, n_used*n_tokens]
+        ggml_backend_sched_set_tensor_backend(sched, cpu_ids, backend_cpu);
+        return { nullptr, ggml_reshape_2d(ctx0, cpu_ids, n_used, n_tokens) };
+    };
+    // a reduced layer has no full host copy, it cannot be computed in full on the CPU
+    auto fallback = [&]() -> llm_graph_moe_cache_slots {
+        if (reduced) {
+            throw std::runtime_error(std::string("MoE cache: layer ") + std::to_string(il) +
+                    " keeps only the experts that are not on the device in host memory, this graph cannot compute it");
+        }
+        return res;
+    };
+
+    // llama4 applies the router weights before the FFN (weight_before_ffn)
+    if (arch == LLM_ARCH_LLAMA4 || !loras->empty()) {
+        return fallback();
+    }
+
+    if (selected_experts->ne[1] == 0) {
+        return res;
+    }
+    // the warmup runs with all experts selected and the misses would not fit in the zero slots
+    if (selected_experts->ne[0] > layer->n_zero) {
+        return reduced ? build_cpu_ids() : res;
+    }
+    for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+        if (w == nullptr) {
+            continue;
+        }
+        if (moe_cache->get_experts(w) == nullptr) {
+            return fallback();
+        }
+        // the transform of a Hadamard-folded weight reads host weights before the slot lookup starts its split
+        if (hdmd != nullptr && hdmd->rot.count(w) > 0) {
+            return fallback();
+        }
+    }
 
     // the slot map is a host weight: the scheduler starts a new split at the lookup and copies it with the copy callback
     // the callback reads the selected experts and records them for the usage counters
@@ -2740,7 +2771,7 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
 
     for (ggml_tensor * t : { cached, cf_f, hit, k, k_rep, z, d, sum, slots }) {
         if (!ggml_backend_supports_op(layer->backend, t)) {
-            return res;
+            return fallback();
         }
     }
 
@@ -2756,12 +2787,8 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     }
     cb(slots, "ffn_moe_slots", il);
 
-    // the expert ids of the misses computed on the CPU, -1 for the experts computed on the device
-    ggml_tensor * cpu_ids = ggml_get_rows(ctx0, layer->cpu_map, ids); // I32 [1, n_used*n_tokens]
-    ggml_backend_sched_set_tensor_backend(sched, cpu_ids, backend_cpu);
-    res.cpu_ids = ggml_reshape_2d(ctx0, cpu_ids, n_used, n_tokens);
-
-    res.slots = slots;
+    res.cpu_ids = build_cpu_ids().cpu_ids;
+    res.slots   = slots;
     return res;
 }
 
