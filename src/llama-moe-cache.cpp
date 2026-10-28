@@ -1,6 +1,7 @@
 #include "llama-moe-cache.h"
 
 #include "llama-impl.h"
+#include "llama-memory.h"
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
@@ -216,7 +217,7 @@ struct llama_moe_cache::impl {
     };
     std::vector<layer_rebalance_stats> last_rebalance_stats;
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
             model(model), size(size), layers(model.layers.size()) {
         read_alignment     = std::max<size_t>(1, model.plain_source_alignment());
         hysteresis         = llama_moe_cache_hysteresis();
@@ -574,58 +575,31 @@ struct llama_moe_cache::impl {
 
         load_profile();
 
-        if (model.hparams.no_alloc) {
-            // only used to measure the memory use, see llama_context::memory_breakdown
-            for (device & d : devices) {
-                if (!d.ctx) {
-                    continue;
-                }
-                d.buf.reset(ggml_backend_buft_alloc_buffer(d.buft, 0));
-                for (ggml_tensor * t = ggml_get_first_tensor(d.ctx.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx.get(), t)) {
-                    t->buffer = d.buf.get();
-                }
-                d.buf_size = ggml_backend_alloc_ctx_tensors_from_buft_size(d.ctx.get(), d.buft);
+        // with no_alloc, dummy buffers are attached so the memory use can still be measured, see llama_context::memory_breakdown
+        auto alloc_bufs = [no_alloc](ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * name, size_t & buf_size) {
+            ggml_backend_buffer_ptr buf = llama_memory_bufs::alloc_buf(ctx, buft, no_alloc, name);
+            buf_size = no_alloc
+                ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft)
+                : ggml_backend_buffer_get_size(buf.get());
+            return buf;
+        };
+        for (device & d : devices) {
+            if (!d.ctx) {
+                continue;
             }
-            if (ctx_host) {
-                buf_host.reset(ggml_backend_buft_alloc_buffer(buft_host, 0));
-                for (ggml_tensor * t = ggml_get_first_tensor(ctx_host.get()); t != nullptr; t = ggml_get_next_tensor(ctx_host.get(), t)) {
-                    t->buffer = buf_host.get();
-                }
-                buf_host_size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx_host.get(), buft_host);
-            }
-            for (auto & [buft, b] : host_banks) {
-                b.buf.reset(ggml_backend_buft_alloc_buffer(buft, 0));
-                for (ggml_tensor * t = ggml_get_first_tensor(b.ctx.get()); t != nullptr; t = ggml_get_next_tensor(b.ctx.get(), t)) {
-                    t->buffer = b.buf.get();
-                }
-                b.buf_size = ggml_backend_alloc_ctx_tensors_from_buft_size(b.ctx.get(), buft);
-            }
-        } else {
-            for (device & d : devices) {
-                if (!d.ctx) {
-                    continue;
-                }
-                d.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.ctx.get(), d.buft));
-                if (!d.buf) {
-                    throw std::runtime_error("failed to allocate the MoE cache buffers");
-                }
+            d.buf = alloc_bufs(d.ctx.get(), d.buft, "MoE cache", d.buf_size);
+            if (!no_alloc) {
                 ggml_backend_buffer_clear(d.buf.get(), 0);
-                d.buf_size = ggml_backend_buffer_get_size(d.buf.get());
             }
-            if (ctx_host) {
-                buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), buft_host));
-                if (!buf_host) {
-                    throw std::runtime_error("failed to allocate the MoE cache buffers");
-                }
-                buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
-            }
-            for (auto & [buft, b] : host_banks) {
-                b.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(b.ctx.get(), buft));
-                if (!b.buf) {
-                    throw std::runtime_error("failed to allocate the MoE cache host buffers");
-                }
-                b.buf_size = ggml_backend_buffer_get_size(b.buf.get());
-            }
+        }
+        if (ctx_host) {
+            buf_host = alloc_bufs(ctx_host.get(), buft_host, "MoE cache slot maps", buf_host_size);
+        }
+        for (auto & [buft, b] : host_banks) {
+            b.buf = alloc_bufs(b.ctx.get(), buft, "MoE cache host banks", b.buf_size);
+        }
+
+        if (!no_alloc) {
 
             // the initial placement comes from the profile when it matches, or from the first experts
             const int64_t t_start_us = ggml_time_us();
@@ -1366,8 +1340,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-    pimpl(new impl(model, backends, bufts, size)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

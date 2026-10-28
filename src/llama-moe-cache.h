@@ -43,7 +43,7 @@ public:
     };
 
     // backends are all the backends of the context, each device caches the MoE layers assigned to it
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
     ~llama_moe_cache();
 
     // the cache of layer il, nullptr if the layer is not cached
