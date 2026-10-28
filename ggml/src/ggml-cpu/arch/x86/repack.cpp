@@ -2358,6 +2358,126 @@ void ggml_gemv_iq4_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #endif
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+// decoded IQ3_S nibble (magnitude code in bits 0-2, sign in bit 3) as value + 128, so vpdpbusd
+// can take the weights as unsigned bytes and the 128 bias is removed with the activation sums
+static const uint8_t kvalues_iq3s_u8[16] = {
+    129, 131, 133, 135, 137, 139, 141, 143, 127, 125, 123, 121, 119, 117, 115, 113,
+};
+
+// one scale per column as 2*ls + 1, repeated over the four dwords of the column lane
+static inline __m256i iq3_s_scale_vec(const block_iq3_sx8 * b, int sb) {
+    uint32_t raw;
+    memcpy(&raw, b->scales + 4 * sb, sizeof(raw));
+
+    // each scale byte holds two columns, low nibble first
+    const __m128i v  = _mm_cvtsi32_si128((int) raw);
+    const __m128i lo = _mm_and_si128(v, _mm_set1_epi8(0x0F));
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0F));
+    const __m256i ls = _mm256_cvtepu8_epi32(_mm_unpacklo_epi8(lo, hi));
+
+    return _mm256_add_epi32(_mm256_slli_epi32(ls, 1), _mm256_set1_epi32(1));
+}
+#endif
+
+void ggml_gemv_iq3_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK_K;
+    const int nb = n / qk;
+    const int ncols_interleaved = 8;
+
+    assert(n % qk == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    const __m512i lut_u = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) kvalues_iq3s_u8));
+    const __m512i m4b   = _mm512_set1_epi8(0x0F);
+    // one scale per column, repeated over the four dwords of the column lane
+    const __m512i dup0 = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    const __m512i dup1 = _mm512_setr_epi32(4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+    // after the in-lane reduction every fourth dword holds one column sum
+    const __m512i combine = _mm512_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    const block_iq3_sx8 * b_ptr_start = (const block_iq3_sx8 *) vx;
+    const block_q8_K    * a_ptr_start = (const block_q8_K    *) vy;
+
+    for (int64_t y = 0; y < nr; y++) {
+
+        const block_q8_K * a_ptr = a_ptr_start + (y * nb);
+
+        for (int64_t x = 0; x < nc / ncols_interleaved; x++) {
+
+            const block_iq3_sx8 * b_ptr = b_ptr_start + (x * nb);
+
+            __m256 accf = _mm256_setzero_ps();
+
+            for (int64_t b = 0; b < nb; b++) {
+
+                if (b + 2 < nb) {
+                    _mm_prefetch((const char *) (b_ptr + b + 2), _MM_HINT_T0);
+                }
+
+                const __m256  col_d = GGML_F32Cx8_LOAD(b_ptr[b].d);
+                const int8_t * aq    = a_ptr[b].qs;
+
+                __m512i sumi0 = _mm512_setzero_si512();
+                __m512i sumi1 = _mm512_setzero_si512();
+
+                for (int sb = 0; sb < qk / 32; sb++) {
+                    const uint8_t * qs = b_ptr[b].qs + 128 * sb;
+                    const int8_t  * a  = aq + 32 * sb;
+
+                    const __m512i qx0 = _mm512_loadu_si512((const __m512i *) qs);
+                    const __m512i qx1 = _mm512_loadu_si512((const __m512i *) (qs + 64));
+
+                    const __m512i w0_lo = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(qx0, m4b));
+                    const __m512i w0_hi = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(_mm512_srli_epi32(qx0, 4), m4b));
+                    const __m512i w1_lo = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(qx1, m4b));
+                    const __m512i w1_hi = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(_mm512_srli_epi32(qx1, 4), m4b));
+
+                    const __m512i a_lo = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) a));
+                    const __m512i a_hi = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) (a + 16)));
+
+                    __m512i p0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w0_lo, a_lo);
+                    p0 = _mm512_dpbusd_epi32(p0, w0_hi, a_hi);
+                    __m512i p1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w1_lo, a_lo);
+                    p1 = _mm512_dpbusd_epi32(p1, w1_hi, a_hi);
+
+                    // remove the +128 weight bias, one dword lane per column carries the whole sub-block
+                    const int bsum = a_ptr[b].bsums[2 * sb] + a_ptr[b].bsums[2 * sb + 1];
+                    const __m512i corr = _mm512_set1_epi32(128 * bsum);
+                    p0 = _mm512_mask_sub_epi32(p0, 0x1111, p0, corr);
+                    p1 = _mm512_mask_sub_epi32(p1, 0x1111, p1, corr);
+
+                    const __m256i ls = iq3_s_scale_vec(b_ptr + b, sb);
+                    const __m512i sc0 = _mm512_permutexvar_epi32(dup0, _mm512_zextsi256_si512(ls));
+                    const __m512i sc1 = _mm512_permutexvar_epi32(dup1, _mm512_zextsi256_si512(ls));
+
+                    sumi0 = _mm512_add_epi32(sumi0, _mm512_mullo_epi32(p0, sc0));
+                    sumi1 = _mm512_add_epi32(sumi1, _mm512_mullo_epi32(p1, sc1));
+                }
+
+                sumi0 = _mm512_add_epi32(sumi0, _mm512_shuffle_epi32(sumi0, (_MM_PERM_ENUM) 0x4E));
+                sumi0 = _mm512_add_epi32(sumi0, _mm512_shuffle_epi32(sumi0, (_MM_PERM_ENUM) 0xB1));
+                sumi1 = _mm512_add_epi32(sumi1, _mm512_shuffle_epi32(sumi1, (_MM_PERM_ENUM) 0x4E));
+                sumi1 = _mm512_add_epi32(sumi1, _mm512_shuffle_epi32(sumi1, (_MM_PERM_ENUM) 0xB1));
+
+                const __m256i sum8 = _mm512_castsi512_si256(_mm512_permutex2var_epi32(sumi0, combine, sumi1));
+
+                const __m256 d_a = _mm256_set1_ps(a_ptr[b].d);
+                accf = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum8), _mm256_mul_ps(col_d, d_a), accf);
+            }
+
+            _mm256_storeu_ps(s + (y * bs + x * ncols_interleaved), accf);
+        }
+    }
+#else
+    ggml_gemv_iq3_s_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+#endif
+}
+
 void ggml_gemv_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
 #if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__AVX512VBMI__) && defined(__AVX512VNNI__)
     gemv_q4_b32_8x8_q8_0_lut_avx512<block_mxfp4x8>(n, s, bs, vx, vy, nr, nc, _mm_loadu_si128((const __m128i*)kvalues_mxfp4));
@@ -3915,6 +4035,134 @@ void ggml_gemm_iq4_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
     }
 #else
     ggml_gemm_iq4_xs_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+#endif
+}
+
+void ggml_gemm_iq3_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK_K;
+    const int nb = n / qk;
+    const int ncols_interleaved = 8;
+
+    assert(n % qk == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    const __m512i lut_u = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) kvalues_iq3s_u8));
+    const __m512i m4b   = _mm512_set1_epi8(0x0F);
+    const __m512i dup0 = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    const __m512i dup1 = _mm512_setr_epi32(4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+    const __m512i combine = _mm512_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    const block_iq3_sx8 * b_ptr_start = (const block_iq3_sx8 *) vx;
+    const block_q8_Kx4  * a_ptr_start = (const block_q8_Kx4  *) vy;
+
+    // one 4-row group per weight pass: keeping a wider pass in registers costs more than the
+    // extra weight reads, which hit L2
+    constexpr int NROWS = 4;
+
+    for (int64_t y = 0; y < nr; y += NROWS) {
+
+        const int nrows = (int) (nr - y < NROWS ? nr - y : NROWS);
+        const int nblk  = (nrows + 3) / 4;
+
+        for (int64_t x = 0; x < nc / ncols_interleaved; x++) {
+
+            const block_iq3_sx8 * b_ptr = b_ptr_start + (x * nb);
+
+            alignas(64) float acc[NROWS][8];
+            for (int r = 0; r < 4 * nblk; r++) {
+                _mm256_storeu_ps(acc[r], _mm256_setzero_ps());
+            }
+
+            for (int64_t b = 0; b < nb; b++) {
+
+                if (b + 2 < nb) {
+                    _mm_prefetch((const char *) (b_ptr + b + 2), _MM_HINT_T0);
+                }
+
+                const __m256 col_d = GGML_F32Cx8_LOAD(b_ptr[b].d);
+
+                // scaled sub-block sums held until the whole super-block is done, so the
+                // horizontal reduction runs once per row instead of once per 64 elements
+                __m512i psum[NROWS][2];
+                for (int r = 0; r < 4 * nblk; r++) {
+                    psum[r][0] = _mm512_setzero_si512();
+                    psum[r][1] = _mm512_setzero_si512();
+                }
+
+                for (int sb = 0; sb < qk / 32; sb++) {
+                    const uint8_t * qs = b_ptr[b].qs + 128 * sb;
+
+                    const __m512i qx0 = _mm512_loadu_si512((const __m512i *) qs);
+                    const __m512i qx1 = _mm512_loadu_si512((const __m512i *) (qs + 64));
+
+                    const __m512i w0_lo = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(qx0, m4b));
+                    const __m512i w0_hi = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(_mm512_srli_epi32(qx0, 4), m4b));
+                    const __m512i w1_lo = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(qx1, m4b));
+                    const __m512i w1_hi = _mm512_shuffle_epi8(lut_u, _mm512_and_si512(_mm512_srli_epi32(qx1, 4), m4b));
+
+                    const __m256i ls  = iq3_s_scale_vec(b_ptr + b, sb);
+                    const __m512i sc0 = _mm512_permutexvar_epi32(dup0, _mm512_zextsi256_si512(ls));
+                    const __m512i sc1 = _mm512_permutexvar_epi32(dup1, _mm512_zextsi256_si512(ls));
+
+                    for (int mb = 0; mb < nblk; mb++) {
+
+                        const block_q8_Kx4 * a_ptr = a_ptr_start + ((y / 4 + mb) * nb);
+                        const int8_t * aqs = a_ptr[b].qs + 128 * sb;
+                        const int16_t * bsums = a_ptr[b].bsums;
+
+                        for (int m = 0; m < 4; m++) {
+                            const __m512i a_lo = iq4_xs_act16(aqs, m);
+                            const __m512i a_hi = iq4_xs_act16(aqs + 64, m);
+
+                            __m512i p0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w0_lo, a_lo);
+                            p0 = _mm512_dpbusd_epi32(p0, w0_hi, a_hi);
+                            __m512i p1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w1_lo, a_lo);
+                            p1 = _mm512_dpbusd_epi32(p1, w1_hi, a_hi);
+
+                            // bsums of the two 16-quant groups of this sub-block for row m
+                            const int bsum = bsums[16 * ((2 * sb) / 4) + 4 * m + ((2 * sb) % 4)] +
+                                             bsums[16 * ((2 * sb + 1) / 4) + 4 * m + ((2 * sb + 1) % 4)];
+                            const __m512i corr = _mm512_set1_epi32(128 * bsum);
+                            p0 = _mm512_mask_sub_epi32(p0, 0x1111, p0, corr);
+                            p1 = _mm512_mask_sub_epi32(p1, 0x1111, p1, corr);
+
+                            const int r = 4 * mb + m;
+                            psum[r][0] = _mm512_add_epi32(psum[r][0], _mm512_mullo_epi32(p0, sc0));
+                            psum[r][1] = _mm512_add_epi32(psum[r][1], _mm512_mullo_epi32(p1, sc1));
+                        }
+                    }
+                }
+
+                for (int mb = 0; mb < nblk; mb++) {
+                    const block_q8_Kx4 * a_ptr = a_ptr_start + ((y / 4 + mb) * nb);
+                    for (int m = 0; m < 4; m++) {
+                        const int r = 4 * mb + m;
+
+                        __m512i isum0 = psum[r][0];
+                        __m512i isum1 = psum[r][1];
+                        isum0 = _mm512_add_epi32(isum0, _mm512_shuffle_epi32(isum0, (_MM_PERM_ENUM) 0x4E));
+                        isum0 = _mm512_add_epi32(isum0, _mm512_shuffle_epi32(isum0, (_MM_PERM_ENUM) 0xB1));
+                        isum1 = _mm512_add_epi32(isum1, _mm512_shuffle_epi32(isum1, (_MM_PERM_ENUM) 0x4E));
+                        isum1 = _mm512_add_epi32(isum1, _mm512_shuffle_epi32(isum1, (_MM_PERM_ENUM) 0xB1));
+
+                        const __m256i sum8 = _mm512_castsi512_si256(_mm512_permutex2var_epi32(isum0, combine, isum1));
+                        const __m256  cd   = _mm256_mul_ps(col_d, _mm256_set1_ps(a_ptr[b].d[m]));
+                        _mm256_storeu_ps(acc[r], _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum8), cd, _mm256_loadu_ps(acc[r])));
+                    }
+                }
+            }
+
+            for (int r = 0; r < nrows; r++) {
+                _mm256_storeu_ps(s + (y + r) * bs + x * ncols_interleaved, _mm256_loadu_ps(acc[r]));
+            }
+        }
+    }
+#else
+    ggml_gemm_iq3_s_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
 #endif
 }
 

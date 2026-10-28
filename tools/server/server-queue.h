@@ -109,6 +109,18 @@ public:
         return queue_tasks_deferred.size();
     }
 
+    // true if a client task is waiting, used to defer optional idle work
+    // the internal NEXT_RESPONSE task only keeps the update loop running, it is not a client task
+    bool has_pending_tasks() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        for (const server_task & task : queue_tasks) {
+            if (task.type != SERVER_TASK_TYPE_NEXT_RESPONSE) {
+                return true;
+            }
+        }
+        return !queue_tasks_deferred.empty();
+    }
+
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //

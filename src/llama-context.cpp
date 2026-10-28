@@ -899,6 +899,13 @@ void llama_context::moe_cache_rebalance() {
     }
 }
 
+void llama_context::moe_cache_rebalance_idle() {
+    // only when the master context exists and the cache is enabled
+    if (sched && moe_cache) {
+        moe_cache->rebalance_idle();
+    }
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
@@ -4250,6 +4257,10 @@ void llama_synchronize(llama_context * ctx) {
 
 void llama_moe_cache_rebalance(llama_context * ctx) {
     ctx->moe_cache_rebalance();
+}
+
+void llama_moe_cache_rebalance_idle(llama_context * ctx) {
+    ctx->moe_cache_rebalance_idle();
 }
 
 float * llama_get_logits(llama_context * ctx) {

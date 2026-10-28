@@ -110,11 +110,13 @@ static bool compute_mul_mat(ggml_backend_t backend, ggml_backend_buffer_type_t b
 
 // same as compute_mul_mat, but src0 is [k, n, n_experts], src1 is [k, n_ids, n_tokens] and ids is
 // [n_ids, n_tokens] as in llama.cpp
+// partial_write feeds the weights one expert plane at a time, like the MoE cache does
 static bool compute_mul_mat_id(ggml_backend_t backend, ggml_backend_buffer_type_t buft,
                                ggml_type type, int64_t k, int64_t n, int64_t n_experts,
                                int64_t n_ids, int64_t n_tokens,
                                const std::vector<uint8_t> & w_q, const std::vector<float> & act,
-                               const std::vector<int32_t> & ids_data, std::vector<float> & out) {
+                               const std::vector<int32_t> & ids_data, std::vector<float> & out,
+                               bool partial_write = false) {
     ggml_context * ctx_w = new_ctx();
     ggml_context * ctx   = new_ctx();
 
@@ -131,7 +133,16 @@ static bool compute_mul_mat_id(ggml_backend_t backend, ggml_backend_buffer_type_
 
     bool ok = buf_w != nullptr && buf != nullptr;
     if (ok) {
-        ggml_backend_tensor_set(w, w_q.data(), 0, ggml_nbytes(w));
+        if (partial_write) {
+            // one plane is one expert: plain-layout bytes into a packed offset
+            const size_t plane = ggml_row_size(type, k) * (size_t) n;
+            GGML_ASSERT(w->nb[2] >= plane);
+            for (int64_t e = 0; e < n_experts; ++e) {
+                ggml_backend_tensor_set(w, w_q.data() + e * plane, (size_t) e * w->nb[2], plane);
+            }
+        } else {
+            ggml_backend_tensor_set(w, w_q.data(), 0, ggml_nbytes(w));
+        }
         ggml_backend_tensor_set(a, act.data(), 0, ggml_nbytes(a));
         ggml_backend_tensor_set(ids, ids_data.data(), 0, ggml_nbytes(ids));
         ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
@@ -247,7 +258,7 @@ int main(void) {
 
     const ggml_type types[] = {
         GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q2_K,
-        GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_Q8_0,
+        GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_MXFP4, GGML_TYPE_Q8_0,
     };
 
     const int64_t k_dense[]     = { 256, 512, 1024 };
@@ -307,6 +318,39 @@ int main(void) {
                             test_mul_mat_id(backend, buft_repack, type, k, n, n_e, n_ids, n_tokens, w_q, ids_data, "rand");
                         }
                     }
+                }
+            }
+        }
+
+        // expert planes written one at a time, like the MoE cache loads them
+        {
+            const int64_t k = 1024, n = 512, n_e = 8;
+            const std::vector<uint8_t> w_q = quantize_weights(type, n * n_e, k);
+
+            for (int64_t n_ids : { 1, 4 }) {
+                std::vector<int32_t> ids_data((size_t) (n_ids * 8));
+                for (size_t i = 0; i < ids_data.size(); ++i) {
+                    ids_data[i] = (int32_t) (rng_state % (uint32_t) n_e);
+                    rng_state = rng_state * 1664525u + 1013904223u;
+                }
+
+                std::vector<float> act((size_t) (k * n_ids * 8));
+                fill_random(act);
+                std::vector<float> ref;
+                std::vector<float> out;
+                const bool ok_ref = compute_mul_mat_id(backend, ggml_backend_cpu_buffer_type(), type, k, n, n_e,
+                                                       n_ids, 8, w_q, act, ids_data, ref);
+                const bool ok_out = compute_mul_mat_id(backend, buft_repack, type, k, n, n_e,
+                                                       n_ids, 8, w_q, act, ids_data, out, true);
+
+                char desc[192];
+                snprintf(desc, sizeof(desc), "MUL_MAT_ID  %-6s planes K = %4lld N = %4lld n_exp = %lld ids = %lld tok = 8",
+                         ggml_type_name(type), (long long) k, (long long) n, (long long) n_e, (long long) n_ids);
+                if (!ok_ref || !ok_out) {
+                    ++n_failed;
+                    printf("FAIL %s : graph compute failed (plain %d, repack %d)\n", desc, (int) ok_ref, (int) ok_out);
+                } else {
+                    compare_and_report(desc, ref, out);
                 }
             }
         }

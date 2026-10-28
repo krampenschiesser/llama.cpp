@@ -919,6 +919,8 @@ struct llama_model {
     bool has_plain_source(const struct ggml_tensor * t) const;
     size_t plain_source_alignment() const;
     bool read_plain_source(const struct ggml_tensor * t, size_t offs, size_t size, void * dst, void * stage, size_t stage_len) const;
+    // read the plain source into an aligned stage buffer, *delta receives the offset of the data in stage
+    bool read_plain_source_staged(const struct ggml_tensor * t, size_t offs, size_t size, void * stage, size_t stage_len, size_t * delta) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

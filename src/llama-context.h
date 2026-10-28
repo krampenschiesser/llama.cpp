@@ -63,6 +63,7 @@ struct llama_context {
 
     // see llama_moe_cache_rebalance()
     void moe_cache_rebalance();
+    void moe_cache_rebalance_idle();
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;

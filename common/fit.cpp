@@ -307,6 +307,23 @@ static void common_params_fit_impl(
         }
     }
 
+    // the MoE cache is allocated before sched_reserve, so its budget competes with the weights and the KV cache
+    // the budget is split by free memory like the cache does, then taken out of the free pool
+    std::vector<int64_t> moe_cache_reserve(nd, 0);
+    if (cparams->moe_cache_size > 0 && hp_nex > 0 && nd > 0) {
+        int64_t sum_free_dev = 0;
+        for (size_t id = 0; id < nd; id++) {
+            sum_free_dev += dmds_full[id].free;
+        }
+        if (sum_free_dev > 0) {
+            for (size_t id = 0; id < nd; id++) {
+                moe_cache_reserve[id] = (int64_t) ((double) cparams->moe_cache_size * (double) dmds_full[id].free / (double) sum_free_dev);
+                dmds_full[id].free = std::max<int64_t>(0, dmds_full[id].free - moe_cache_reserve[id]);
+            }
+            LOG_INF("%s: reserving %" PRId64 " MiB for the MoE cache\n", __func__, (int64_t) cparams->moe_cache_size/MiB);
+        }
+    }
+
     int64_t sum_free            = 0;
     int64_t sum_projected_free  = 0;
     int64_t sum_projected_used  = 0;
@@ -625,6 +642,10 @@ static void common_params_fit_impl(
         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         add_extra_memory(dmds_cpu_moe);
+
+        for (size_t id = 0; id < nd; id++) {
+            dmds_cpu_moe[id].free = std::max<int64_t>(0, dmds_cpu_moe[id].free - moe_cache_reserve[id]);
+        }
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;

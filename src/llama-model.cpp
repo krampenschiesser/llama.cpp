@@ -3071,6 +3071,32 @@ bool llama_model::read_plain_source(const ggml_tensor * t, size_t offs, size_t s
     return true;
 }
 
+bool llama_model::read_plain_source_staged(const ggml_tensor * t, size_t offs, size_t size, void * stage, size_t stage_len, size_t * delta) const {
+    const auto it = pimpl->plain_srcs.find(t);
+    if (it == pimpl->plain_srcs.end() || it->second.file_idx >= pimpl->plain_files.size()) {
+        return false;
+    }
+
+    const size_t nbytes = ggml_nbytes(t);
+    if (offs > nbytes || size > nbytes - offs) {
+        return false;
+    }
+
+    const auto & src = it->second;
+    const auto * file = pimpl->plain_files[src.file_idx].get();
+    if (file->read_alignment() > 1) {
+        if (stage == nullptr || stage_len == 0) {
+            return false;
+        }
+        file->read_at_direct_stage(src.offs + offs, size, stage, stage_len, delta);
+    } else {
+        file->read_at(src.offs + offs, stage, size);
+        *delta = 0;
+    }
+
+    return true;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {

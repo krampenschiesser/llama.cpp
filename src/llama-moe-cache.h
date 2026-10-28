@@ -64,9 +64,10 @@ public:
     // no expert moves here, the counters are applied only by rebalance() while the context is idle
     void begin();
 
-    // move the most used experts to the layers that collected enough selections, the devices must be idle
-    // call only when no work is in flight, e.g. when all server slots are released
+    // move the most used experts, the devices must be idle, call only when no work is in flight
+    // rebalance() ignores the per layer threshold, rebalance_idle() applies it (see --moe-cache-* env)
     void rebalance();
+    void rebalance_idle();
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

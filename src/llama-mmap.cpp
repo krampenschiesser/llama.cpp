@@ -458,6 +458,47 @@ struct llama_file::impl {
         std::memcpy(ptr, reinterpret_cast<const char *>(stage) + (offset - start), len);
     }
 
+    void read_at_direct_stage(size_t offset, size_t len, void * stage, size_t stage_len, size_t * delta) const {
+        GGML_ASSERT(has_direct_io());
+        GGML_ASSERT(stage != nullptr);
+        GGML_ASSERT((reinterpret_cast<uintptr_t>(stage) & (alignment - 1)) == 0);
+
+        const size_t start = offset & ~(alignment - 1);
+        const size_t end = offset + len;
+        const size_t aligned_end = (end + alignment - 1) & ~(alignment - 1);
+        const size_t read_len = aligned_end - start;
+
+        if (read_len > stage_len) {
+            throw std::runtime_error(format("direct read range %zu exceeds stage size %zu", read_len, stage_len));
+        }
+
+        // the caller only uses [offset, offset + len), which is inside [start, min(aligned_end, size)),
+        // so the bytes past the end of the file never need to be zeroed
+        const size_t expected = start < size ? std::min(aligned_end, size) - start : 0;
+
+        size_t bytes_read = 0;
+        while (bytes_read < expected) {
+            const ssize_t ret = ::pread(fd, reinterpret_cast<char *>(stage) + bytes_read,
+                                        read_len - bytes_read, (off_t) (start + bytes_read));
+            if (ret < 0 && errno == EINTR) {
+                continue;
+            }
+            if (ret < 0) {
+                throw std::runtime_error(format("direct read error at offset %zu: %s", start + bytes_read, strerror(errno)));
+            }
+            if (ret == 0) {
+                break;
+            }
+            bytes_read += (size_t) ret;
+        }
+
+        if (bytes_read < expected) {
+            throw std::runtime_error(format("direct read error at offset %zu: unexpectedly reached end of file", start + bytes_read));
+        }
+
+        *delta = offset - start;
+    }
+
     void write_raw(const void * ptr, size_t len) const {
         if (len == 0) {
             return;
@@ -517,6 +558,7 @@ const std::string & llama_file::name() const { return pimpl->fname; }
 
 void llama_file::read_at(size_t offset, void * dst, size_t len) const { pimpl->read_at(offset, dst, len); }
 void llama_file::read_at_direct(size_t offset, void * dst, size_t len, void * stage, size_t stage_len) const { pimpl->read_at_direct(offset, dst, len, stage, stage_len); }
+void llama_file::read_at_direct_stage(size_t offset, size_t len, void * stage, size_t stage_len, size_t * delta) const { pimpl->read_at_direct_stage(offset, len, stage, stage_len, delta); }
 
 int llama_file::file_id() const {
 #ifdef _WIN32

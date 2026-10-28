@@ -37,6 +37,10 @@ struct llama_file {
     // positional read for a direct I/O file: stage must be aligned, stage_len is its usable size
     void read_at_direct(size_t offset, void * dst, size_t len, void * stage, size_t stage_len) const;
 
+    // positional read for a direct I/O file: the aligned range is read into stage and *delta
+    // receives the offset of the data of [offset, offset + len) in stage
+    void read_at_direct_stage(size_t offset, size_t len, void * stage, size_t stage_len, size_t * delta) const;
+
     void seek(size_t offset, int whence) const;
 
     void read_raw(void * ptr, size_t len);

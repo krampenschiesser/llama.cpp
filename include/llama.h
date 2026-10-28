@@ -1147,7 +1147,11 @@ extern "C" {
     // Apply the MoE cache usage counters and move the most used experts to the device cache.
     // Call only when no work is in flight, e.g. when all inference slots are idle or released.
     // No-op if the model has no MoE cache. [EXPERIMENTAL]
+    // applies the MoE cache usage counters, e.g. after prompt processing and before the decode
     LLAMA_API void llama_moe_cache_rebalance(struct llama_context * ctx);
+
+    // same, but only for the layers that collected enough selections, e.g. while the server is idle
+    LLAMA_API void llama_moe_cache_rebalance_idle(struct llama_context * ctx);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously

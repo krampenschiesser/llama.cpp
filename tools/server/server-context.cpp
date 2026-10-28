@@ -1095,6 +1095,11 @@ private:
 
     int n_empty_consecutive = 0;
 
+    // a slot finished its prompt in this batch, the prompt usage is applied to the MoE cache
+    // before the next decode, see the end of update_slots()
+    bool    moe_rebalance_pending  = false;
+    int64_t moe_rebalance_n_prompt = 0;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -1536,11 +1541,15 @@ private:
                 if (!all_idle) {
                     return;
                 }
+                // serve a waiting client task first, the idle rebalance can run on the next idle window
+                if (queue_tasks.has_pending_tasks()) {
+                    return;
+                }
                 if (ctx_tgt != nullptr) {
-                    llama_moe_cache_rebalance(ctx_tgt);
+                    llama_moe_cache_rebalance_idle(ctx_tgt);
                 }
                 if (ctx_dft != nullptr) {
-                    llama_moe_cache_rebalance(ctx_dft);
+                    llama_moe_cache_rebalance_idle(ctx_dft);
                 }
             };
 
@@ -3594,6 +3603,21 @@ private:
                 break; // stop any further processing
             }
         }
+
+        // no work is queued for the devices here: place the experts with the prompt usage before the decode
+        if (moe_rebalance_pending) {
+            moe_rebalance_pending = false;
+
+            SRV_INF("moe cache: rebalance after prompt processing, %" PRId64 " prompt tokens\n", moe_rebalance_n_prompt);
+            moe_rebalance_n_prompt = 0;
+
+            if (ctx_tgt != nullptr) {
+                llama_moe_cache_rebalance(ctx_tgt);
+            }
+            if (ctx_dft != nullptr) {
+                llama_moe_cache_rebalance(ctx_dft);
+            }
+        }
     }
 
     void process_tts_slots() {
@@ -4767,6 +4791,10 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // the prompt usage is complete, apply it to the MoE cache placement
+                moe_rebalance_pending  = true;
+                moe_rebalance_n_prompt += slot.task->n_tokens();
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
