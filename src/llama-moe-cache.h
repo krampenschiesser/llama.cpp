@@ -49,7 +49,6 @@ struct llama_model;
 //   LLAMA_MOE_CACHE_MAX_PROMOTE    max experts promoted by one idle rebalance
 //   LLAMA_MOE_CACHE_MAX_PROMOTE_MIB max bytes promoted by one idle rebalance
 //   LLAMA_MOE_CACHE_MAX_PROMOTE_MS target duration of an idle rebalance
-//   LLAMA_MOE_CACHE_PIPE           bit mask: 1 async split copies, 2 host split on a worker (default 3)
 //   LLAMA_MOE_CACHE_TRACE          log the per graph cost of the bookkeeping (default off)
 //   LLAMA_MOE_CACHE_CPU_DEVICE     allow the CPU backend as the cache device (tests only)
 class llama_moe_cache {

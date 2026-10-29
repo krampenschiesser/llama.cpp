@@ -52,13 +52,15 @@ responsible:
 ## Configuration
 
 ```
-LLAMA_MOE_CACHE_PIPE        bit mask, 1 = async split copies, 2 = host split on a worker
-                            (default 3, 0 restores the synchronous inline path)
 GGML_SCHED_NO_COPY_STREAM   keep the device to host copies on the compute stream (debug)
 GGML_SCHED_NO_PREFETCH      issue the copies at the consuming split instead of the producing one
 GGML_SCHED_DEBUG=2          print the split count and the copy counters of each compute
 LLAMA_MOE_CACHE_TRACE=1     per graph bookkeeping cost of the cache
 ```
+
+The pipeline is always on for a cached layer, there is no switch. `GGML_SCHED_NO_COPY_STREAM` and
+`GGML_SCHED_NO_PREFETCH` only exist to bisect a scheduler regression, they are not performance
+options.
 
 Copy counters of one decode graph of a 7 layer cache: `26 splits, ~23 async copies, 0 sync copies,
 14/14 prefetched`.
