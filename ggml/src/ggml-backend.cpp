@@ -2504,7 +2504,14 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    const enum ggml_status status = ggml_backend_sched_compute_splits(sched);
+
+    if (sched->debug >= 2) {
+        GGML_LOG_DEBUG("%s: %d splits, %d async copies, %d sync copies (%.0f us)\n", __func__,
+                sched->n_splits, sched->n_async_copies, sched->n_sync_copies, (double) sched->sync_us);
+    }
+
+    return status;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

@@ -2637,6 +2637,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         experts = ggml_add(ctx0, experts_dev, experts_cpu);
         ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->get_layer(il)->backend);
+        // the add starts its own split so the device half is queued before the CPU half is joined
+        ggml_backend_sched_set_split_barrier(sched, experts);
         cb(experts, "ffn_moe_down_merged", il);
     }
 

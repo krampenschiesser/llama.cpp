@@ -744,13 +744,14 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
-    // opt-in: run the CPU misses of a cached layer while the device computes its cached experts.
-    // measured slightly slower on the GPUs tested (the per split worker handoff costs more than the
-    // overlap saves), so it is off by default and LLAMA_MOE_CACHE_OVERLAP=1 enables it
+    // the MoE cache splits every cached layer into a CPU half and a device half, both can run at the same
+    // time: the copies cross backends asynchronously and the host split runs on a worker thread.
+    // LLAMA_MOE_CACHE_PIPE=0 falls back to the synchronous copies and the inline host split
     if (moe_cache != nullptr) {
-        const char * env = getenv("LLAMA_MOE_CACHE_OVERLAP");
-        const bool overlap = env != nullptr && *env != '\0' && atoi(env) != 0;
-        ggml_backend_sched_set_cpu_overlap(sched.get(), overlap);
+        const char * env = getenv("LLAMA_MOE_CACHE_PIPE");
+        const bool pipe = env == nullptr || *env == '\0' || atoi(env) != 0;
+        ggml_backend_sched_set_async_copies(sched.get(), pipe);
+        ggml_backend_sched_set_cpu_overlap(sched.get(), pipe);
     }
 }
 
