@@ -1285,6 +1285,15 @@ static bool ggml_backend_sched_is_split_barrier(ggml_backend_sched_t sched, cons
     return false;
 }
 
+// an asynchronous copy may run on another stream until the host split consumes it, the source must
+// not be overwritten before that, so it stays alive until the end of the graph
+static void ggml_backend_sched_keep_alive(struct ggml_tensor * t) {
+    while (t->view_src != NULL) {
+        t = t->view_src;
+    }
+    ggml_set_output(t);
+}
+
 // give a host split input copy a buffer in pinned host memory of the source device
 // the tensor is then allocated outside of ggml-alloc, which is what the async copy needs
 static void ggml_backend_sched_pinned_alloc(ggml_backend_sched_t sched, int src_backend_id, struct ggml_tensor * t) {
@@ -1730,6 +1739,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 ggml_backend_buft_is_host(sched->bufts[cur_backend_id]) &&
                                 !ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(sched->backends[src_backend_id]))) {
                             ggml_backend_sched_pinned_alloc(sched, src_backend_id, tensor_id_copy(src_id, cur_backend_id, 0));
+                            ggml_backend_sched_keep_alive(src);
                         }
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
