@@ -2421,8 +2421,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
             sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
         }
 
-        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[b]));
-        sched->copy_d2h[b] = (ggml_backend_copy_d2h_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_d2h");
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
+        ggml_backend_reg_t reg = dev != NULL ? dev->reg : NULL;
+        sched->copy_d2h[b] = reg != NULL ?
+            (ggml_backend_copy_d2h_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_d2h") : NULL;
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);

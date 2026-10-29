@@ -746,10 +746,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     // the MoE cache splits every cached layer into a CPU half and a device half, both can run at the same
     // time: the copies cross backends asynchronously and the host split runs on a worker thread.
-    // LLAMA_MOE_CACHE_PIPE=0 falls back to the synchronous copies and the inline host split
+    // opt-in for now, the pipeline is not correct yet with every device configuration
     if (moe_cache != nullptr) {
         const char * env = getenv("LLAMA_MOE_CACHE_PIPE");
-        const bool pipe = env == nullptr || *env == '\0' || atoi(env) != 0;
+        const bool pipe = env != nullptr && *env != '\0' && atoi(env) != 0;
         ggml_backend_sched_set_async_copies(sched.get(), pipe);
         ggml_backend_sched_set_cpu_overlap(sched.get(), pipe);
     }
