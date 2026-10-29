@@ -49,7 +49,8 @@ static __global__ void mm_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                // a negative id skips the computation, it belongs to no expert
+                nex_prev += expert_used >= 0 && expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -75,7 +76,8 @@ static __global__ void mm_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            // a negative id skips the computation, it belongs to no expert
+            nex_prev += expert_used >= 0 && expert_used < expert;
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -114,6 +116,22 @@ static __global__ void mm_ids_helper(
         }
     }
 
+    // a negative id skips the computation. the compact GEMM reads every entry of the map, so the
+    // entries of the skipped columns must hold a valid row: for the inverse map the first free compact
+    // row, which the GEMM never reads, and for the forward map the tail beyond the compact rows
+    if (write_inverse) {
+        if (blockIdx.x == 0) {
+            const int ncols = n_tokens*n_expert_used_var;
+            for (int c = threadIdx.x; c < ncols; c += warp_size) {
+                const int it  = c / n_expert_used_var;
+                const int iex = c % n_expert_used_var;
+                if (ids[it*si1 + iex] < 0) {
+                    ids_src1[c] = ncols - 1;
+                }
+            }
+        }
+    }
+
     if (threadIdx.x != 0) {
         return;
     }
@@ -125,6 +143,13 @@ static __global__ void mm_ids_helper(
     }
 
     expert_bounds[gridDim.x] = nex_prev + it_compact;
+
+    if (!write_inverse) {
+        const int ncols = n_tokens*n_expert_used_var;
+        for (int c = expert_bounds[gridDim.x] + threadIdx.x; c < ncols; c += warp_size) {
+            ids_src1[c] = 0;
+        }
+    }
 }
 
 template <int n_expert_used_template>
@@ -176,4 +201,32 @@ void ggml_cuda_launch_mm_ids_helper(
             launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
     }
+}
+
+// zero the dst columns whose id is negative, the skipped experts of the MoE cache
+static __global__ void mm_ids_zero_skipped(
+        float * __restrict__ dst, const int32_t * __restrict__ ids,
+        const int64_t ne0, const int64_t n_expert_used, const int64_t ids_stride,
+        const int64_t nb0, const int64_t nb1, const int64_t nb2) {
+    const int64_t c = blockIdx.x;
+    const int64_t k = c % n_expert_used;
+    const int64_t t = c / n_expert_used;
+    if (ids[t*ids_stride + k] >= 0) {
+        return;
+    }
+    char * d = (char *) dst + k*nb1 + t*nb2;
+    for (int64_t i = threadIdx.x; i < ne0; i += blockDim.x) {
+        *(float *) (d + i*nb0) = 0.0f;
+    }
+}
+
+void ggml_cuda_launch_mm_ids_zero_skipped(
+        float * dst, const int32_t * ids, const int64_t ne0, const int64_t n_tokens, const int64_t n_expert_used, const int64_t ids_stride,
+        const int64_t nb0, const int64_t nb1, const int64_t nb2, cudaStream_t stream) {
+    const int64_t ncols = n_tokens*n_expert_used;
+    if (ncols <= 0) {
+        return;
+    }
+    GGML_ASSERT(ncols < (1 << 30));
+    mm_ids_zero_skipped<<<(int) ncols, 128, 0, stream>>>(dst, ids, ne0, n_expert_used, ids_stride, nb0, nb1, nb2);
 }

@@ -381,6 +381,9 @@ void ggml_cuda_mul_mat_q(
         ne12, J_best};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+
+    ggml_cuda_launch_mm_ids_zero_skipped(dst_d, (const int32_t *) ids->data, dst->ne[0], ne12, n_expert_used,
+        ids->nb[1] / ggml_element_size(ids), dst->nb[0], dst->nb[1], dst->nb[2], stream);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

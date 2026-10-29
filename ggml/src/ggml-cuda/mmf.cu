@@ -128,6 +128,11 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         default:
             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
     }
+
+    if (ids) {
+        ggml_cuda_launch_mm_ids_zero_skipped(dst_d, ids_d, dst->ne[0], ne12, ids->ne[0], ids_s1,
+            dst->nb[0], dst->nb[1], dst->nb[2], ctx.stream());
+    }
 }
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne,

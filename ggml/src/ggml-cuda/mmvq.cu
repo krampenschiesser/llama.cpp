@@ -660,6 +660,21 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
+    if constexpr (ncols_dst == 1) {
+        if (ids != nullptr && !shared_expert && ids[channel_dst] < 0) {
+            // the id skips the computation, the result of this column is zero
+            float * dst_skip = dst + blockIdx.z*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+            if (threadIdx.y == 0) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+                        dst_skip[i] = 0.0f;
+                    }
+                }
+            }
+            return;
+        }
+    }
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
@@ -940,6 +955,13 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
+    if (!shared_expert && ids[channel_dst + token_idx * ids_stride] < 0) {
+        // the id skips the computation, the result of this column is zero
+        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+            dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
