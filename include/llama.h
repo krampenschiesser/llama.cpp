@@ -1147,10 +1147,10 @@ extern "C" {
     // Apply the MoE cache usage counters and move the most used experts to the device cache.
     // Waits for the pending work of the context, the placement must not move while work is in flight.
     // No-op if the model has no MoE cache. [EXPERIMENTAL]
-    // applies the MoE cache usage counters, e.g. after prompt processing and before the decode
+    // bounded pass, e.g. after prompt processing and before the decode: it only moves the clear winners
     LLAMA_API void llama_moe_cache_rebalance(struct llama_context * ctx);
 
-    // same, but only for the layers that collected enough selections, e.g. while the server is idle
+    // full pass, e.g. while the server is idle: it finishes the convergence of the placement
     LLAMA_API void llama_moe_cache_rebalance_idle(struct llama_context * ctx);
 
     // Usage counters and memory of the MoE cache of the context, enabled is false without a cache

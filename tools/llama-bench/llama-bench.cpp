@@ -2496,8 +2496,9 @@ int llama_bench(int argc, char ** argv) {
                 }
             }
 
-            // no work is in flight: apply the MoE cache usage counters from the warmup, no-op without a cache
-            llama_moe_cache_rebalance(ctx);
+            // no work is in flight: apply the MoE cache usage counters from the warmup like a server does
+            // when it goes idle, no-op without a cache
+            llama_moe_cache_rebalance_idle(ctx);
             const llama_moe_cache_stats moe_stats = llama_moe_cache_get_stats(ctx);
             if (moe_stats.enabled) {
                 fprintf(stderr, "%s: MoE cache: %d layers, %d experts on the device (%.2f MiB), %.2f MiB host, "

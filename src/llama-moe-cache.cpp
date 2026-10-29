@@ -26,6 +26,11 @@
 
 namespace {
 
+// the rebalance after a prompt runs before the first decode step, keep it short: only the clear winners
+// move there, the idle rebalance finishes the convergence
+constexpr int64_t  moe_cache_post_us      = 100*1000;
+constexpr uint64_t moe_cache_post_promote = 64;
+
 // gate, up, down or gate_up, down
 static std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_layer & layer) {
     std::vector<ggml_tensor *> res;
@@ -50,14 +55,16 @@ static uint8_t * llama_moe_cache_align_ptr(void * ptr, size_t alignment) {
     return reinterpret_cast<uint8_t *>((base + alignment - 1) & ~(uintptr_t) (alignment - 1));
 }
 
-static uint64_t llama_moe_cache_min_rebalance(int32_t n_expert) {
+static uint64_t llama_moe_cache_min_rebalance() {
     const char * env = getenv("LLAMA_MOE_CACHE_REBALANCE");
     if (env != nullptr && *env != '\0') {
         const long long value = atoll(env);
         return value > 0 ? (uint64_t) value : 1;
     }
-    // about 32 selections per expert in the epoch, below that the tail of the counts is sampling noise
-    return std::max<uint64_t>(8192, 32ull*(uint64_t) n_expert);
+    // an idle rebalance consumes the selections of the decode of the last task, e.g. 64 tokens of 8
+    // experts give 512 per layer. a few selections are enough to refresh the placement, below that it
+    // is sampling noise
+    return 8;
 }
 
 // an expert that is not cached must be used this much more than the incumbent to take its row
@@ -90,11 +97,11 @@ static size_t llama_moe_cache_max_promote_bytes() {
     return value > 0 ? (size_t) value*1024*1024 : (size_t) 1;
 }
 
-// target duration of a forced rebalance, the byte budget is derived from the measured rate
+// target duration of an idle rebalance, the byte budget is derived from the measured rate
 static int64_t llama_moe_cache_max_promote_us() {
     const char * env = getenv("LLAMA_MOE_CACHE_MAX_PROMOTE_MS");
     if (env == nullptr || *env == '\0') {
-        return 250*1000;
+        return 1500*1000;
     }
     const long long value = atoll(env);
     return value > 0 ? value*1000 : 1;
@@ -367,6 +374,7 @@ struct llama_moe_cache::impl {
 
     double   hysteresis  = 1.25; // an expert must beat the incumbent by this factor to take its row
     uint64_t max_promote = 512;  // experts promoted by one rebalance call
+
     size_t max_promote_bytes = 1024*1024*1024; // bytes promoted by one rebalance call
     int64_t  max_promote_us  = 250*1000;      // target duration of a forced rebalance
     double   promote_bytes_per_s = 2.0*1024*1024*1024; // measured promotion rate
@@ -808,7 +816,7 @@ struct llama_moe_cache::impl {
                     l.info.n_host   = l.n_host;
                     l.info.n_expert = l.n_expert;
 
-                    l.rebalance_min = llama_moe_cache_min_rebalance(l.n_expert);
+                    l.rebalance_min = llama_moe_cache_min_rebalance();
                 }
 
                 devices[l.id].buf_size += alloc_size(l, d, l.n_cached_experts_per_layer);
@@ -1650,7 +1658,7 @@ struct llama_moe_cache::impl {
     // rebalance the layers that collected enough selections, or all of them when forced, bounded by
     // the promotion budget. the budget starts with an equal share per layer so that high layer ids
     // do not starve, the leftover is used in a second pass
-    uint64_t rebalance_layers(bool force, uint64_t max_experts, size_t max_bytes) {
+    uint64_t rebalance_layers(uint64_t min_selections, uint64_t max_experts, size_t max_bytes) {
         std::vector<size_t> candidates;
         std::vector<char>   touched(layers.size(), 0);
         for (size_t il = 0; il < layers.size(); ++il) {
@@ -1658,15 +1666,25 @@ struct llama_moe_cache::impl {
             if (l.id < 0 || l.full) {
                 continue;
             }
-            // a forced rebalance skips the layers without new selections, re-sorting them with the
-            // same counters only decays the history
-            const uint64_t min = force ? 1 : l.rebalance_min;
+            // a rebalance without a minimum skips the layers without new selections, re-sorting them
+            // with the same counters only decays the history
+            const uint64_t min = min_selections > 0 ? min_selections : l.rebalance_min;
             if (l.usage_epoch < min) {
                 continue;
             }
             candidates.push_back(il);
         }
         if (candidates.empty()) {
+            uint64_t max_epoch = 0;
+            uint64_t min_epoch = 0;
+            for (const layer & l : layers) {
+                if (l.id >= 0 && !l.full) {
+                    max_epoch = std::max(max_epoch, l.usage_epoch);
+                    min_epoch = std::max(min_epoch, min_selections > 0 ? min_selections : l.rebalance_min);
+                }
+            }
+            LLAMA_LOG_DEBUG("llama_moe_cache: rebalance skipped, %" PRIu64 " selections per layer < %" PRIu64 "\n",
+                    max_epoch, min_epoch);
             return 0;
         }
 
@@ -1782,7 +1800,14 @@ struct llama_moe_cache::impl {
 
     // apply the usage counters while the devices are idle, e.g. after all server slots are released
     // when forced the per layer threshold is ignored, e.g. to apply the usage of a prompt before the decode
+    // the server calls this with force after a prompt and without when all slots are idle. both calls
+    // place experts: the first one is bounded hard because it runs before the first decode step, the
+    // idle one finishes the convergence with the full budget and a small noise floor per layer
     void rebalance(bool force) {
+        const uint64_t min_sel   = force ? 1 : 0; // 0 means the per layer noise floor
+        const uint64_t experts   = force ? std::min(moe_cache_post_promote, max_promote) : max_promote;
+        const int64_t  budget_us = force ? moe_cache_post_us : max_promote_us;
+
         const uint64_t rebalances_before = n_rebalances_total;
         const uint64_t uploaded_before   = n_uploaded_total;
         const size_t   bytes_before      = uploaded_bytes_total;
@@ -1792,18 +1817,14 @@ struct llama_moe_cache::impl {
         }
         finish_reads();
 
-        // a forced rebalance runs between a prompt and the decode, bound its duration with the measured
-        // promotion rate. the idle rebalance has no one waiting, only the byte budget applies
-        size_t bytes_budget = max_promote_bytes;
-        if (force) {
-            const size_t timed = (size_t) (promote_bytes_per_s*(double) max_promote_us/1e6);
-            bytes_budget = std::min(bytes_budget, std::max<size_t>(1, timed));
-        }
+        // bound the duration of a rebalance with the measured promotion rate
+        const size_t timed = (size_t) (promote_bytes_per_s*(double) budget_us/1e6);
+        size_t bytes_budget = std::min(max_promote_bytes, std::max<size_t>(1, timed));
 
         // only the layers that collected enough selections since the last rebalance move their experts
         last_rebalance_stats.clear();
         const int64_t t_start_us = ggml_time_us();
-        const uint64_t moved = rebalance_layers(force, max_promote, bytes_budget);
+        const uint64_t moved = rebalance_layers(min_sel, experts, bytes_budget);
         run_uploads(std::move(pending_jobs), std::move(pending_swaps));
         const double elapsed_s = (ggml_time_us() - t_start_us)/1e6;
 
@@ -1821,7 +1842,7 @@ struct llama_moe_cache::impl {
             }
             LLAMA_LOG_INFO("llama_moe_cache: rebalance%s: %" PRIu64 " layer(s), %" PRIu64 " experts promoted, "
                     "%" PRIu64 " expert uploads (%.2f MiB, %.2f MiB/s), %" PRIu64 " selections counted, %.2f s\n",
-                force ? " (forced)" : " (idle)",
+                force ? " (after prompt)" : " (idle)",
                 n_rebalances_total - rebalances_before, n_loaded_experts,
                 n_uploaded_total - uploaded_before, (uploaded_bytes_total - bytes_before)/1024.0/1024.0,
                 (uploaded_bytes_total - bytes_before)/1024.0/1024.0/std::max(1e-6, elapsed_s),

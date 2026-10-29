@@ -35,20 +35,20 @@ struct llama_model;
 // owns the host banks too and keeps there only the experts that are not in the device cache. the
 // host banks are filled from the plain GGUF source.
 //
-// the selected experts are counted on the host after the graph compute. the placement ranks the
-// experts by a long history that forgets 1/8 of its counts per rebalance, while the rebalance
-// trigger counts only the selections since the last rebalance. when the devices are idle and enough
-// experts were counted, the most used experts are copied to the device cache and the maps are
-// updated. the two rows of a swap are exchanged between the banks, the model file is read only when
-// a type has no derepack or to fill the host banks when they are created.
+// the selected experts are counted on the host. the placement ranks the experts by a long history that
+// forgets 1/8 of its counts per rebalance. there are two placement points: after a prompt, bounded hard
+// because the decode is about to start and only the clear winners move, and when all slots are idle,
+// which finishes the convergence with the full budget. the two rows of a swap are exchanged between the
+// banks, the model file is read only when a type has no derepack or to fill the host banks when they are
+// created.
 //
 // environment:
 //   LLAMA_MOE_CACHE_RESERVE_MIB    free device memory kept for the KV cache and the compute buffers
 //   LLAMA_MOE_CACHE_REBALANCE      selections per layer before an idle rebalance
 //   LLAMA_MOE_CACHE_HYSTERESIS     factor a promoted expert must beat the evicted one by
-//   LLAMA_MOE_CACHE_MAX_PROMOTE    max experts promoted by one rebalance
-//   LLAMA_MOE_CACHE_MAX_PROMOTE_MIB max bytes promoted by one rebalance
-//   LLAMA_MOE_CACHE_MAX_PROMOTE_MS target duration of a forced rebalance
+//   LLAMA_MOE_CACHE_MAX_PROMOTE    max experts promoted by one idle rebalance
+//   LLAMA_MOE_CACHE_MAX_PROMOTE_MIB max bytes promoted by one idle rebalance
+//   LLAMA_MOE_CACHE_MAX_PROMOTE_MS target duration of an idle rebalance
 //   LLAMA_MOE_CACHE_OVERLAP        run the CPU misses while the device computes (default off)
 //   LLAMA_MOE_CACHE_TRACE          log the per graph cost of the bookkeeping (default off)
 //   LLAMA_MOE_CACHE_CPU_DEVICE     allow the CPU backend as the cache device (tests only)
@@ -102,7 +102,8 @@ public:
     void finish();
 
     // move the most used experts, the devices must be idle, call only when no work is in flight
-    // rebalance() ignores the per layer threshold, rebalance_idle() applies it (see the env vars above)
+    // rebalance() runs after a prompt with a small budget and moves the clear winners,
+    // rebalance_idle() runs when no slot is busy and finishes the convergence (see the env vars above)
     void rebalance();
     void rebalance_idle();
 
