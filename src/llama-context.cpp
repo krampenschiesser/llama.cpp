@@ -750,6 +750,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     // rebalance can change the output, see the rebalance check in test-llama-archs
     if (moe_cache != nullptr) {
         ggml_backend_sched_set_async_copies(sched.get(), true);
+        ggml_backend_sched_set_pinned_copies(sched.get(), true);
         ggml_backend_sched_set_cpu_overlap(sched.get(), true);
         // the host split of a cached layer counts the selected experts from the ids it reads
         ggml_backend_sched_set_split_callback(sched.get(), sched_count_moe_ids, this);
@@ -1653,6 +1654,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    // a decode copies a few KB per layer and the blocking copy drains the device each time, the
+    // asynchronous copies hide that; a prompt copies megabytes and the blocking copy into the pinned
+    // buffers of the scheduler is faster than the events and the second stream of the async path.
+    // measured on ling3-tiny and kwai-coder, see the moe cache pipeline notes
+    if (moe_cache) {
+        constexpr uint32_t async_max_tokens = 32;
+        ggml_backend_sched_set_async_copies(sched.get(), ubatch.n_tokens < async_max_tokens);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
