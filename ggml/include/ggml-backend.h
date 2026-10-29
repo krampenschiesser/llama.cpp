@@ -378,6 +378,21 @@ extern "C" {
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 
+    // Called right before a split is computed
+    typedef void (*ggml_backend_sched_split_callback)(ggml_backend_t backend, struct ggml_cgraph * graph, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_split_callback(ggml_backend_sched_t sched, ggml_backend_sched_split_callback callback, void * user_data);
+
+    // Start a new split at this node, the node becomes the first node of its split
+    // the barriers are consumed by the next graph split
+    GGML_API void                 ggml_backend_sched_set_split_barrier(ggml_backend_sched_t sched, struct ggml_tensor * node);
+
+    // Copy the inputs that cross backends asynchronously instead of stopping at the copy
+    // a host split waits for its copies before it runs, so the device work after it can be queued
+    GGML_API void                 ggml_backend_sched_set_async_copies(ggml_backend_sched_t sched, bool enable);
+
+    // Report the copy and synchronization counters of the last compute, debug only
+    GGML_API void                 ggml_backend_sched_get_copy_stats(ggml_backend_sched_t sched, int * n_sync, int * n_async, int64_t * sync_us);
+
     // Run a host split on a worker thread while the next split runs on the device.
     // Only enabled when the scheduler has a single copy buffer. The scheduler joins the worker
     // before any split that reads its results.
