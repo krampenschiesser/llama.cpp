@@ -206,6 +206,7 @@ struct llama_moe_cache::impl {
         ggml_backend_t backend = nullptr;
         ggml_backend_buffer_type_t buft = nullptr;
         size_t host_bytes = 0; // bytes of the host experts of the layers it caches
+        bool skip_negative = false; // mul_mat_id skips the selections whose id is negative
 
 
         // device storage of the banks
@@ -248,6 +249,7 @@ struct llama_moe_cache::impl {
         int32_t n_host  = 0;  // host slots of the layer, n_expert if the model keeps the host copy
         bool    host_banked = false; // the cache owns the host copy of the experts
         bool    full    = false; // the whole layer is in the device bank, the graph reads it as a plain FFN
+        bool    skip_negative = false; // the device skips the misses by id, the bank has no zero rows
         size_t host_bytes = 0;
 
         std::vector<ggml_tensor *> experts; // model expert tensors, in the order of the banks
@@ -415,6 +417,10 @@ struct llama_moe_cache::impl {
             auto & d = devices.emplace_back();
             d.backend = backends[i];
             d.buft    = bufts[i];
+            // a negative id means "skip this selection", the cache then needs no zero rows
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(d.backend));
+            d.skip_negative = getenv("LLAMA_MOE_CACHE_NO_SKIP") == nullptr && reg != nullptr &&
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_mul_mat_id_skip_negative") != nullptr;
         }
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
             throw std::runtime_error("MoE cache does not support tensor parallelism");
@@ -466,6 +472,7 @@ struct llama_moe_cache::impl {
             l.n_expert  = n_expert;
             l.host_banked = host_banked;
             // the graph selects the model wide number of experts for every layer, size the zero rows for it
+            // a device that skips negative ids does not need them
             l.n_zero    = n_used_max;
             for (const ggml_tensor * t : l.experts) {
                 l.host_bytes += ggml_nbytes(t);
@@ -475,6 +482,10 @@ struct llama_moe_cache::impl {
                 return ggml_backend_get_device(d.backend) == model.dev_layer(il);
             });
             l.id = it_dev == devices.end() ? -1 : (int32_t) (it_dev - devices.begin());
+            l.skip_negative = l.id >= 0 && devices[l.id].skip_negative;
+            if (l.skip_negative) {
+                l.n_zero = 0;
+            }
             // the graph disables the cache for Hadamard-folded weights, keep the full host copy for them
             for (const ggml_tensor * t : l.experts) {
                 if (model.hdmd.rot.count(t) > 0) {
@@ -563,7 +574,10 @@ struct llama_moe_cache::impl {
 
             for (const layer & l : layers) {
                 if (l.id == (int32_t) id) {
-                    capacity[id] += (double) alloc_size(l, d, std::max<int32_t>(0, l.n_expert - 2));
+                    // the device must be able to hold the largest footprint of a layer, a full layer, or
+                    // the partial bank when the zero rows make it larger
+                    capacity[id] += (double) std::max(alloc_size_n(l, d, l.n_expert, 0),
+                                                      alloc_size(l, d, std::max<int32_t>(0, l.n_expert - 2)));
                 }
             }
             if (free_mem > 0) {
@@ -696,7 +710,10 @@ struct llama_moe_cache::impl {
                     l.usage_idx = devices[l.id].usage_n_layers++;
                     devices[l.id].usage_layers.push_back((int32_t) il);
                     if (l.usage_idx == 0) {
-                        n_tensors[l.id] += 2;         // usage buffer and expert position of the device
+                        n_tensors[l.id] += 1;         // usage buffer of the device
+                        if (!devices[l.id].skip_negative) {
+                            n_tensors[l.id] += 1;     // expert position, only for the slot expression
+                        }
                     }
                 }
             }
@@ -730,11 +747,16 @@ struct llama_moe_cache::impl {
             if (d.ctx && d.usage_n_layers > 0) {
                 d.usage = ggml_new_tensor_1d(d.ctx.get(), GGML_TYPE_I32, (int64_t) d.usage_n_layers*usage_rows_max);
                 ggml_format_name(d.usage, "moe_cache.usage-%d", (int) (&d - devices.data()));
-                d.k_base = ggml_new_tensor_1d(d.ctx.get(), GGML_TYPE_F32, n_used_max);
-                ggml_format_name(d.k_base, "moe_cache.k_base-%d", (int) (&d - devices.data()));
+                if (!d.skip_negative) {
+                    d.k_base = ggml_new_tensor_1d(d.ctx.get(), GGML_TYPE_F32, n_used_max);
+                    ggml_format_name(d.k_base, "moe_cache.k_base-%d", (int) (&d - devices.data()));
+                }
                 const size_t alignment = ggml_backend_buft_get_alignment(d.buft);
                 d.usage_bytes = ggml_nbytes(d.usage);
-                d.buf_size += GGML_PAD(d.usage_bytes, alignment) + GGML_PAD(ggml_nbytes(d.k_base), alignment);
+                d.buf_size += GGML_PAD(d.usage_bytes, alignment);
+                if (d.k_base != nullptr) {
+                    d.buf_size += GGML_PAD(ggml_nbytes(d.k_base), alignment);
+                }
             }
         }
         if (n_tensors_host > 0) {
@@ -769,7 +791,7 @@ struct llama_moe_cache::impl {
                 }
 
                 if (!l.full) {
-                    l.slot_map = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, l.n_expert);
+                    l.slot_map = ggml_new_tensor_2d(ctx, l.skip_negative ? GGML_TYPE_I32 : GGML_TYPE_F32, 1, l.n_expert);
                     ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", (int) il);
 
                     l.cpu_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, l.n_expert);
@@ -782,6 +804,7 @@ struct llama_moe_cache::impl {
                     l.info.k_base   = d.k_base;
                     l.info.n_cached_experts_per_layer  = l.n_cached_experts_per_layer;
                     l.info.n_zero   = l.n_zero;
+                    l.info.skip_negative = l.skip_negative;
                     l.info.n_host   = l.n_host;
                     l.info.n_expert = l.n_expert;
 
@@ -914,9 +937,15 @@ struct llama_moe_cache::impl {
                         (int) il, ggml_type_name(l.experts[0]->type));
                     continue;
                 }
-                LLAMA_LOG_INFO("%s: %2d layer, %s: %5d cached experts, %d zero rows (%.1f%%)\n", "llama_moe_cache",
-                    (int) il, ggml_type_name(l.experts[0]->type), l.n_cached_experts_per_layer, l.n_zero,
-                    100.0*l.n_cached_experts_per_layer/l.n_expert);
+                if (l.skip_negative) {
+                    LLAMA_LOG_INFO("%s: %2d layer, %s: %5d cached experts, skips the misses (%.1f%%)\n", "llama_moe_cache",
+                        (int) il, ggml_type_name(l.experts[0]->type), l.n_cached_experts_per_layer,
+                        100.0*l.n_cached_experts_per_layer/l.n_expert);
+                } else {
+                    LLAMA_LOG_INFO("%s: %2d layer, %s: %5d cached experts, %d zero rows (%.1f%%)\n", "llama_moe_cache",
+                        (int) il, ggml_type_name(l.experts[0]->type), l.n_cached_experts_per_layer, l.n_zero,
+                        100.0*l.n_cached_experts_per_layer/l.n_expert);
+                }
             }
         }
         LLAMA_LOG_INFO("%s: initial placement of %.2f MiB from the plain source, %.2f MiB to the host banks\n", "llama_moe_cache",
@@ -940,6 +969,22 @@ struct llama_moe_cache::impl {
     void write_maps(layer & l) {
         if (l.cpu_map == nullptr) {
             // the layer is not cached, the CPU map is not used
+            return;
+        }
+        // a device that skips negative ids reads -1 for the misses and the plain slot for the hits
+        if (l.skip_negative) {
+            std::vector<int32_t> slots(l.n_expert, -1);
+            int32_t * cpu = (int32_t *) l.cpu_map->data;
+            for (int32_t e = 0; e < l.n_expert; ++e) {
+                if (l.slot_of[e] >= 0) {
+                    slots[e] = l.slot_of[e];
+                    cpu[e]   = -1;
+                } else {
+                    slots[e] = -1;
+                    cpu[e]   = l.host_banked ? l.host_slot_of[e] : e;
+                }
+            }
+            ggml_backend_tensor_set(l.slot_map, slots.data(), 0, slots.size()*sizeof(int32_t));
             return;
         }
         std::vector<float> slots(l.n_expert, 0.0f);

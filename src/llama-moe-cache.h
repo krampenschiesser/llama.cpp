@@ -61,6 +61,7 @@ public:
         ggml_tensor  * k_base;   // F32 [n_expert_used_max] in device memory: expert position of the slot expression
         int32_t        n_cached_experts_per_layer; // number of experts of the layer kept in the device cache
         int32_t        n_zero;   // zero rows at the end of the device banks, the misses read them
+        bool           skip_negative; // the device skips the misses by id, the banks have no zero rows
         int32_t        n_host;   // host slots of the layer, n_expert if the model keeps the host copy
         int32_t        n_expert; // experts of the layer
 
