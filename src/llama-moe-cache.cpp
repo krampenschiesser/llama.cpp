@@ -222,15 +222,14 @@ struct llama_moe_cache::impl {
         // expert position of the slot expression, [n_used_max] F32
         ggml_tensor * k_base = nullptr;
 
-        // readback of the usage buffers, [2] is one graph compute behind, count when a slot is reused
-        ggml_backend_buffer_ptr read_buf[2];
-        size_t read_buf_size[2] = { 0, 0 };
-        ggml_backend_event_t read_ev[2] = { nullptr, nullptr };
-        bool   read_pending[2] = { false, false };
-        std::vector<int32_t> read_rows[2]; // rows of each slice of the pending graph, by slice index
-        std::vector<int32_t> read_rows_cur; // rows of the current graph when the device has no host buffer
+        // host slab that receives the usage ids of the graphs in flight, one fixed slot per queued graph
+        ggml_backend_buffer_ptr read_slab;
+        size_t read_stride = 0;             // bytes of one slot, padded
+        std::vector<ggml_backend_event_t> read_ev; // one event per slot
+        std::vector<int32_t> read_free;     // indices of the free slots
+        std::vector<int32_t> read_rows_cur; // rows of the current graph, by usage slice
         std::vector<uint8_t> read_data;     // host copy when the device has no host buffer
-        uint32_t read_ring = 0;
+        static constexpr int32_t read_n_slots = 8; // graphs in flight before the queue is drained early
     };
 
     // host storage of the experts that are not in the device cache, owned by the cache
@@ -326,6 +325,15 @@ struct llama_moe_cache::impl {
 
     // ranking counters, one per expert, they keep a long history
     std::vector<std::vector<uint64_t>> usage;
+
+    // one graph of usage ids in flight: which device, which readback slot, and the rows of its slices
+    struct usage_record {
+        int32_t dev;
+        int32_t slot;
+        std::vector<int32_t> rows;
+    };
+    std::mutex usage_mutex;             // end() pushes, the placement and the stats drain
+    std::vector<usage_record> usage_queue;
 
     // selected experts of the graph being built or of the last built graph, per layer
     mutable std::vector<int32_t> build_rows;
@@ -916,12 +924,12 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
-        finish_reads();
+        drain_usage();
         for (device & d : devices) {
-            for (int slot = 0; slot < 2; ++slot) {
-                if (d.read_ev[slot] != nullptr) {
-                    ggml_backend_event_free(d.read_ev[slot]);
-                    d.read_ev[slot] = nullptr;
+            for (ggml_backend_event_t & ev : d.read_ev) {
+                if (ev != nullptr) {
+                    ggml_backend_event_free(ev);
+                    ev = nullptr;
                 }
             }
         }
@@ -1541,27 +1549,57 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // count the graph held by a readback slot of the device
-    void count_read(device & d, int slot) {
-        if (!d.read_pending[slot]) {
+    // host pointer of a readback slot of the device
+    const void * read_slot_ptr(const device & d, int32_t slot) const {
+        return (const uint8_t *) ggml_backend_buffer_get_base(d.read_slab.get()) + (size_t) slot*d.read_stride;
+    }
+
+    // make the readback slab of the device, allocated once and reused by the slots
+    void init_read_slab(device & d, ggml_backend_buffer_type_t buft_host) {
+        if (d.read_slab) {
             return;
         }
+        const size_t alignment = std::max<size_t>(1, ggml_backend_buft_get_alignment(buft_host));
+        d.read_stride = GGML_PAD(d.usage_bytes, alignment);
+        d.read_slab.reset(ggml_backend_buft_alloc_buffer(buft_host, d.read_stride*device::read_n_slots));
+        if (!d.read_slab) {
+            throw std::runtime_error("failed to allocate the MoE cache read buffer");
+        }
+        d.read_ev.resize(device::read_n_slots, nullptr);
+        for (int32_t i = device::read_n_slots - 1; i >= 0; --i) {
+            d.read_free.push_back(i);
+        }
+    }
+
+    // count the graph held by a readback slot of the device, the event may still be in flight
+    void count_read(device & d, int32_t slot, const std::vector<int32_t> & rows_of) {
         if (d.read_ev[slot] != nullptr) {
             ggml_backend_event_synchronize(d.read_ev[slot]);
         } else {
             ggml_backend_synchronize(d.backend);
         }
-        count_rows(d, (const int32_t *) ggml_backend_buffer_get_base(d.read_buf[slot].get()), d.read_rows[slot].data());
-        d.read_pending[slot] = false;
+        count_rows(d, (const int32_t *) read_slot_ptr(d, slot), rows_of.data());
     }
 
-    // count the reads that are still in flight, called when no work is in flight or before a rebalance
-    void finish_reads() {
-        for (device & d : devices) {
-            for (int slot = 0; slot < 2; ++slot) {
-                count_read(d, slot);
-            }
+    // count the graphs that are queued and release their buffers, called when the placement is decided
+    // or when the counters are read. no expert moves here
+    void drain_usage() {
+        std::lock_guard<std::mutex> lock(usage_mutex);
+        const int64_t t0 = trace ? ggml_time_us() : 0;
+        for (const usage_record & r : usage_queue) {
+            device & d = devices[r.dev];
+            count_read(d, r.slot, r.rows);
+            d.read_free.push_back(r.slot);
         }
+        usage_queue.clear();
+        if (trace) {
+            trace_count_us += ggml_time_us() - t0;
+        }
+    }
+
+    // count the reads that are still in flight
+    void finish_reads() {
+        drain_usage();
     }
 
     // rebalance the layers that collected enough selections, or all of them when forced, bounded by
@@ -1821,26 +1859,41 @@ struct llama_moe_cache::impl {
                 continue;
             }
             // the usage buffer holds the rows of every graph in the same layout, so the whole buffer is
-            // read back with one call and the counters consume the slot two graphs later
-            const int slot = (int) (d.read_ring++ & 1);
-            if (d.read_pending[slot]) {
-                count_read(d, slot);
-            }
-            if (d.read_buf_size[slot] < d.usage_bytes) {
-                const size_t alignment = std::max<size_t>(1, ggml_backend_buft_get_alignment(buft_host));
-                d.read_buf[slot].reset(ggml_backend_buft_alloc_buffer(buft_host, GGML_PAD(d.usage_bytes, alignment)));
-                if (!d.read_buf[slot]) {
-                    throw std::runtime_error("failed to allocate the MoE cache read buffer");
+            // read back with one call into a slot of the slab. the record is counted later, at the
+            // placement or when the stats are read, so the submit thread does not wait for the readback
+            init_read_slab(d, buft_host);
+            int32_t slot = -1;
+            {
+                std::lock_guard<std::mutex> lock(usage_mutex);
+                if (!d.read_free.empty()) {
+                    slot = d.read_free.back();
+                    d.read_free.pop_back();
                 }
-                d.read_buf_size[slot] = d.usage_bytes;
             }
-            ggml_backend_tensor_get_async(d.backend, d.usage, ggml_backend_buffer_get_base(d.read_buf[slot].get()), 0, d.usage_bytes);
+            if (slot < 0) {
+                // all slots are in flight, count the queued graphs now
+                drain_usage();
+                std::lock_guard<std::mutex> lock(usage_mutex);
+                slot = d.read_free.back();
+                d.read_free.pop_back();
+            }
             if (d.read_ev[slot] == nullptr) {
                 d.read_ev[slot] = ggml_backend_event_new(ggml_backend_get_device(d.backend));
             }
+            if (d.read_ev[slot] == nullptr) {
+                // the backend has no events, count right away
+                ggml_backend_tensor_get(d.usage, const_cast<void *>(read_slot_ptr(d, slot)), 0, d.usage_bytes);
+                count_rows(d, (const int32_t *) read_slot_ptr(d, slot), d.read_rows_cur.data());
+                std::lock_guard<std::mutex> lock(usage_mutex);
+                d.read_free.push_back(slot);
+                continue;
+            }
+            ggml_backend_tensor_get_async(d.backend, d.usage, const_cast<void *>(read_slot_ptr(d, slot)), 0, d.usage_bytes);
             ggml_backend_event_record(d.read_ev[slot], d.backend);
-            d.read_pending[slot] = true;
-            d.read_rows[slot] = d.read_rows_cur;
+            {
+                std::lock_guard<std::mutex> lock(usage_mutex);
+                usage_queue.push_back({ (int32_t) (&d - devices.data()), slot, d.read_rows_cur });
+            }
 
             bytes_read += d.usage_bytes;
             if (trace) {
