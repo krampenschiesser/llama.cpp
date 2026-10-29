@@ -2423,7 +2423,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
         ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
         ggml_backend_reg_t reg = dev != NULL ? dev->reg : NULL;
-        sched->copy_d2h[b] = reg != NULL ?
+        static const bool no_copy_stream = getenv("GGML_SCHED_NO_COPY_STREAM") != NULL;
+        sched->copy_d2h[b] = reg != NULL && !no_copy_stream ?
             (ggml_backend_copy_d2h_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_d2h") : NULL;
     }
 

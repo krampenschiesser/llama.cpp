@@ -752,6 +752,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
         const bool pipe = env != nullptr && *env != '\0' && atoi(env) != 0;
         ggml_backend_sched_set_async_copies(sched.get(), pipe);
         ggml_backend_sched_set_cpu_overlap(sched.get(), pipe);
+        if (pipe) {
+            LLAMA_LOG_WARN("%s: MoE cache pipeline enabled, CUDA graphs must be disabled (GGML_CUDA_DISABLE_GRAPHS=1)\n", __func__);
+        }
     }
 }
 
