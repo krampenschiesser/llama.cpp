@@ -11,11 +11,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 // ggml_backend_cpu_repack_buffer_type is declared in ggml/src/ggml-cpu/repack.h; only the symbol
 // is needed here, like the kernel prototypes in test-repack-gemv.cpp
 ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
+bool ggml_backend_cpu_repack_derepack(const struct ggml_tensor * tensor, int64_t plane, void * data);
 
 // failed cases; main exits non-zero on any failures
 static int n_failed = 0;
@@ -66,6 +68,168 @@ static bool has_repack_trait(ggml_type type) {
     }
     ggml_free(ctx_w);
     return has;
+}
+
+// the MoE cache keeps its experts packed on the host; derepack decodes one expert plane back to
+// the plain layout so that it can be uploaded without reading the model file. The decoded values
+// must match the plain blocks exactly.
+static void test_derepack(ggml_backend_buffer_type_t buft_repack, ggml_type type,
+                          int64_t k, int64_t n, int64_t n_e, bool require) {
+    ggml_context * ctx_w = new_ctx();
+    ggml_tensor * w = ggml_new_tensor_3d(ctx_w, type, k, n, n_e);
+    ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft_repack);
+
+    const size_t plane   = ggml_row_size(type, k) * (size_t) n;
+    const size_t n_plane = (size_t) (k * n);
+    const std::vector<uint8_t> w_q = quantize_weights(type, n * n_e, k);
+
+    char desc[160];
+    snprintf(desc, sizeof(desc), "DEREPACK    %-6s K = %4lld N = %4lld n_exp = %lld",
+             ggml_type_name(type), (long long) k, (long long) n, (long long) n_e);
+
+    if (buf_w == nullptr) {
+        ++n_failed;
+        printf("FAIL %s : buffer allocation failed\n", desc);
+        ggml_free(ctx_w);
+        return;
+    }
+
+    ggml_backend_tensor_set(w, w_q.data(), 0, plane * (size_t) n_e);
+
+    std::vector<uint8_t> decoded(plane);
+    std::vector<float> f_ref(n_plane);
+    std::vector<float> f_out(n_plane);
+
+    const auto * traits = ggml_get_type_traits(type);
+    bool ok = true;
+    float max_err = 0.0f;
+
+    for (int64_t e = 0; e < n_e && ok; ++e) {
+        if (!ggml_backend_cpu_repack_derepack(w, e, decoded.data())) {
+            ok = false;
+            break;
+        }
+        traits->to_float(w_q.data() + e * plane, f_ref.data(), n_plane);
+        traits->to_float(decoded.data(),            f_out.data(), n_plane);
+        for (size_t i = 0; i < n_plane; ++i) {
+            const float err = fabsf(f_ref[i] - f_out[i]);
+            if (err > max_err) {
+                max_err = err;
+            }
+        }
+    }
+
+    if (!ok) {
+        if (require) {
+            ++n_failed;
+            printf("FAIL %s : no derepack\n", desc);
+        } else {
+            printf("SKIP %s : no derepack\n", desc);
+        }
+    } else {
+        const bool pass = max_err == 0.0f;
+        if (!pass) {
+            ++n_failed;
+        }
+        printf("%s %s : max_err = %.6g\n", pass ? "OK  " : "FAIL", desc, max_err);
+    }
+
+    ggml_backend_buffer_free(buf_w);
+    ggml_free(ctx_w);
+}
+
+// true if the dequantized values of two plain block ranges are identical
+static bool same_values(ggml_type type, const uint8_t * a, const uint8_t * b, int64_t n) {
+    std::vector<float> fa((size_t) n);
+    std::vector<float> fb((size_t) n);
+    ggml_get_type_traits(type)->to_float(a, fa.data(), n);
+    ggml_get_type_traits(type)->to_float(b, fb.data(), n);
+    return memcmp(fa.data(), fb.data(), fa.size()*sizeof(float)) == 0;
+}
+
+// the MoE cache exchanges the row of a promoted expert with the row of an evicted expert: the
+// packed host row is derepacked into the device bank and the plain device row is repacked into the
+// host bank. Both views must hold the expected expert afterwards.
+static void test_exchange(ggml_backend_buffer_type_t buft_repack, ggml_type type,
+                          int64_t k, int64_t n, int64_t n_e, bool require) {
+    char desc[160];
+    snprintf(desc, sizeof(desc), "EXCHANGE    %-6s K = %4lld N = %4lld n_exp = %lld",
+             ggml_type_name(type), (long long) k, (long long) n, (long long) n_e);
+
+    ggml_context * ctx_host = new_ctx();
+    ggml_context * ctx_dev  = new_ctx();
+    ggml_tensor * host = ggml_new_tensor_3d(ctx_host, type, k, n, n_e);
+    ggml_tensor * dev  = ggml_new_tensor_3d(ctx_dev,  type, k, n, n_e);
+
+    ggml_backend_buffer_t buf_host = ggml_backend_alloc_ctx_tensors_from_buft(ctx_host, buft_repack);
+    ggml_backend_buffer_t buf_dev  = ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev,  ggml_backend_cpu_buffer_type());
+    if (buf_host == nullptr || buf_dev == nullptr) {
+        ++n_failed;
+        printf("FAIL %s : buffer allocation failed\n", desc);
+        ggml_free(ctx_host);
+        ggml_free(ctx_dev);
+        return;
+    }
+
+    const size_t plane   = ggml_row_size(type, k) * (size_t) n;
+    const size_t n_plane = (size_t) (k * n);
+    const std::vector<uint8_t> w_host = quantize_weights(type, n * n_e, k);
+    const std::vector<uint8_t> w_dev  = quantize_weights(type, n * n_e, k);
+
+    ggml_backend_tensor_set(host, w_host.data(), 0, plane * (size_t) n_e);
+    ggml_backend_tensor_set(dev,  w_dev.data(),  0, plane * (size_t) n_e);
+
+    const int64_t p = 1; // promoted expert, host bank
+    const int64_t e = 2; // evicted expert, device bank
+
+    std::vector<uint8_t> evict(plane);
+    std::vector<uint8_t> promoted(plane);
+    ggml_backend_tensor_get(dev, evict.data(), (size_t) e * dev->nb[2], plane);
+
+    if (!ggml_backend_cpu_repack_derepack(host, p, promoted.data())) {
+        if (require) {
+            ++n_failed;
+            printf("FAIL %s : no derepack\n", desc);
+        } else {
+            printf("SKIP %s : no derepack\n", desc);
+        }
+        ggml_backend_buffer_free(buf_host);
+        ggml_backend_buffer_free(buf_dev);
+        ggml_free(ctx_host);
+        ggml_free(ctx_dev);
+        return;
+    }
+
+    // the promoted expert takes the device row of the evicted expert, the evicted expert takes the
+    // host row of the promoted expert
+    ggml_backend_tensor_set(dev, promoted.data(), (size_t) e * dev->nb[2], plane);
+    ggml_backend_tensor_set(host, evict.data(), (size_t) p * host->nb[2], plane);
+
+    bool ok = true;
+    std::vector<uint8_t> tmp(plane);
+    ggml_backend_tensor_get(dev, tmp.data(), (size_t) e * dev->nb[2], plane);
+    ok = ok && same_values(type, tmp.data(), w_host.data() + p * plane, n_plane);
+
+    for (int64_t q = 0; q < n_e && ok; ++q) {
+        if (!ggml_backend_cpu_repack_derepack(host, q, tmp.data())) {
+            ok = false;
+            break;
+        }
+        const uint8_t * expect = q == p ? w_dev.data() + e * plane : w_host.data() + q * plane;
+        ok = ok && same_values(type, tmp.data(), expect, n_plane);
+    }
+
+    if (!ok) {
+        ++n_failed;
+        printf("FAIL %s : wrong expert data after the exchange\n", desc);
+    } else {
+        printf("OK   %s\n", desc);
+    }
+
+    ggml_backend_buffer_free(buf_host);
+    ggml_backend_buffer_free(buf_dev);
+    ggml_free(ctx_host);
+    ggml_free(ctx_dev);
 }
 
 // weight tensor in buft, everything else in the plain CPU buffer, both graphs are built the same
@@ -281,6 +445,11 @@ int main(void) {
             printf("SKIP %s : no repack trait in this build\n", ggml_type_name(type));
             continue;
         }
+
+        const bool has_derepack = type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS ||
+                                  type == GGML_TYPE_IQ3_S || type == GGML_TYPE_MXFP4;
+        test_derepack(buft_repack, type, 256, 16, 3, has_derepack);
+        test_exchange(buft_repack, type, 256, 16, 4, has_derepack);
 
         for (size_t ik = 0; ik < sizeof(k_dense)/sizeof(k_dense[0]); ++ik) {
             for (size_t in = 0; in < sizeof(n_dense)/sizeof(n_dense[0]); ++in) {

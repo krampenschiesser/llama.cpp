@@ -10,6 +10,9 @@
 
 ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 
+// decode one plane of a packed tensor back to the plain layout, false when the type has no inverse
+bool ggml_backend_cpu_repack_derepack(const struct ggml_tensor * tensor, int64_t plane, void * data);
+
 template <int K> constexpr int QK_0() {
     if constexpr (K == 1) {
         return QK1_0;

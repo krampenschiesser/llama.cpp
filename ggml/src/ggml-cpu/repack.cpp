@@ -3968,6 +3968,65 @@ static int repack_q6_K_to_q6_K_8_bl(struct ggml_tensor * t, int interleave_block
     return 0;
 }
 
+// inverse of repack_q6_K_to_q6_K_8_bl, the packed layout is the plain blocks reordered
+static int derepack_q6_K_from_q6_K_8_bl(const struct ggml_tensor * t, int interleave_block, void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q6_K);
+    GGML_ASSERT(interleave_block == 4 || interleave_block == 8);
+
+    const block_q6_Kx8 * src = (const block_q6_Kx8 *) t->data;
+          block_q6_K   * dst = (      block_q6_K   *) data;
+
+    const int nrow = ggml_nrows(t);
+    const int nrows_interleaved = 8;
+    const int nblocks = t->ne[0] / QK_K;
+
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q6_K));
+
+    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % 8 != 0) {
+        return -1;
+    }
+
+    const int end_ls = QK_K * 4 / interleave_block;
+    const int end_hs = end_ls / 2;
+    const int n_scales = QK_K / 16;
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            const block_q6_Kx8 * blk = src++;
+            block_q6_K tmp[8];
+            memset(tmp, 0, sizeof(tmp));
+
+            for (int r = 0; r < nrows_interleaved; r++) {
+                tmp[r].d = blk->d[r];
+            }
+            for (int i = 0; i < end_ls; i++) {
+                const int src_id     = i % nrows_interleaved;
+                const int src_offset = (i / nrows_interleaved) * interleave_block;
+                const int dst_offset = i * interleave_block;
+
+                memcpy(&tmp[src_id].ql[src_offset], &blk->ql[dst_offset], interleave_block);
+            }
+            for (int i = 0; i < end_hs; i++) {
+                const int src_id     = i % nrows_interleaved;
+                const int src_offset = (i / nrows_interleaved) * interleave_block;
+                const int dst_offset = i * interleave_block;
+
+                memcpy(&tmp[src_id].qh[src_offset], &blk->qh[dst_offset], interleave_block);
+            }
+            for (int i = 0; i < nrows_interleaved; i++) {
+                for (int j = 0; j < n_scales; j++) {
+                    tmp[i].scales[j] = blk->scales[j * nrows_interleaved + i];
+                }
+            }
+
+            for (int r = 0; r < nrows_interleaved; r++) {
+                dst[(b + r) * nblocks + x] = tmp[r];
+            }
+        }
+    }
+    return 0;
+}
+
 static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(interleave_block == 8);
@@ -4354,6 +4413,55 @@ static int repack_iq4_xs_to_iq4_xs_8_bl(struct ggml_tensor * t, int interleave_b
     return 0;
 }
 
+// inverse of repack_iq4_xs_to_iq4_xs_8_bl, the packed layout is the plain blocks reordered
+static int derepack_iq4_xs_from_iq4_xs_8_bl(const struct ggml_tensor * t, void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_IQ4_XS);
+
+    const block_iq4_xsx8 * src = (const block_iq4_xsx8 *) t->data;
+          block_iq4_xs    * dst = (      block_iq4_xs    *) data;
+
+    const int nrow = ggml_nrows(t);
+    const int nrows_interleaved = 8;
+    const int nblocks = t->ne[0] / QK_K;
+
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_iq4_xs));
+
+    if (t->ne[1] % nrows_interleaved != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            const block_iq4_xsx8 * blk = src++;
+            block_iq4_xs tmp[8];
+            memset(tmp, 0, sizeof(tmp));
+
+            for (int r = 0; r < nrows_interleaved; r++) {
+                tmp[r].d = blk->d[r];
+            }
+            for (int s = 0; s < 8; s++) {
+                uint64_t scales = 0;
+                memcpy(&scales, &blk->scales[6 * s], 6);
+                for (int r = 0; r < nrows_interleaved; r++) {
+                    const int ls = (int) ((scales >> (6 * r)) & 0x3F);
+                    tmp[r].scales_l[s / 2] |= (uint8_t) ((ls & 0x0F) << (4 * (s % 2)));
+                    tmp[r].scales_h        |= (uint16_t) (((ls >> 4) & 0x03) << (2 * s));
+                }
+            }
+            for (int s = 0; s < 8; s++) {
+                for (int r = 0; r < nrows_interleaved; r++) {
+                    memcpy(tmp[r].qs + 16 * s, &blk->qs[128 * s + 16 * r], 16);
+                }
+            }
+
+            for (int r = 0; r < nrows_interleaved; r++) {
+                dst[(b + r) * nblocks + x] = tmp[r];
+            }
+        }
+    }
+    return 0;
+}
+
 // IQ3_S stores a 32-quant sub-block as 8 grid indices of 9 bits plus 32 sign bits; decode each quant
 // to a signed 4-bit code here so the kernels never need the iq3s_grid lookup
 static block_iq3_sx8 make_block_iq3_sx8(const block_iq3_s * in) {
@@ -4428,6 +4536,109 @@ static int repack_iq3_s_to_iq3_s_8_bl(struct ggml_tensor * t, int interleave_blo
             *dst++ = make_block_iq3_sx8(dst_tmp);
         }
         src += nrows_interleaved * nblocks;
+    }
+    return 0;
+}
+
+// reverse lookup of the iq3s_grid codebook: the 4 magnitudes of a group are compressed to one
+// 3-bit code each, which indexes the grid entry that decodes to them
+struct iq3_s_grid_rev {
+    int16_t idx[4096];
+
+    iq3_s_grid_rev() {
+        for (int i = 0; i < 4096; i++) {
+            idx[i] = -1;
+        }
+        for (int i = 0; i < 512; i++) {
+            const uint32_t v = iq3s_grid[i];
+            int key = 0;
+            for (int j = 0; j < 4; j++) {
+                key |= (int) (((v >> (8 * j)) & 0xFF) >> 1) << (3 * j);
+            }
+            idx[key] = (int16_t) i;
+        }
+    }
+};
+
+static const iq3_s_grid_rev & iq3_s_grid_rev_get(void) {
+    static const iq3_s_grid_rev table;
+    return table;
+}
+
+// inverse of repack_iq3_s_to_iq3_s_8_bl, the magnitude and sign of every quant are re-encoded to
+// the iq3s_grid index of the plain block, the values are the same but the indices may differ
+static int derepack_iq3_s_from_iq3_s_8_bl(const struct ggml_tensor * t, void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_IQ3_S);
+
+    const block_iq3_sx8 * src = (const block_iq3_sx8 *) t->data;
+          block_iq3_s   * dst = (      block_iq3_s   *) data;
+
+    const iq3_s_grid_rev & rev = iq3_s_grid_rev_get();
+
+    const int nrow = ggml_nrows(t);
+    const int nrows_interleaved = 8;
+    const int nblocks = t->ne[0] / QK_K;
+
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_iq3_s));
+
+    if (t->ne[1] % nrows_interleaved != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            const block_iq3_sx8 * blk = src++;
+            block_iq3_s tmp[8];
+            memset(tmp, 0, sizeof(tmp));
+
+            for (int r = 0; r < nrows_interleaved; r++) {
+                tmp[r].d = blk->d[r];
+            }
+            for (int sb = 0; sb < 8; sb++) {
+                for (int r = 0; r < nrows_interleaved; r++) {
+                    const int scale = (blk->scales[4 * sb + r / 2] >> (4 * (r % 2))) & 0x0F;
+                    tmp[r].scales[sb / 2] |= (uint8_t) (scale << (4 * (sb % 2)));
+                }
+            }
+            for (int sb = 0; sb < 8; sb++) {
+                for (int r = 0; r < nrows_interleaved; r++) {
+                    block_iq3_s * cur = &tmp[r];
+                    const uint8_t * q = blk->qs + 128 * sb + 16 * r;
+
+                    for (int e = 0; e < 4; e++) {
+                        uint32_t w;
+                        memcpy(&w, q + 4 * e, sizeof(w));
+
+                        int key_lo = 0;
+                        int key_hi = 0;
+                        for (int k = 0; k < 4; k++) {
+                            const uint8_t nb = (uint8_t) ((w >> (8 * k)) & 0xFF);
+                            const int mag_lo = (nb >> 0) & 0x07;
+                            const int mag_hi = (nb >> 4) & 0x07;
+                            const int bit    = (4 * e + k) % 8;
+
+                            key_lo |= mag_lo << (3 * k);
+                            key_hi |= mag_hi << (3 * k);
+
+                            cur->signs[4 * sb + e / 2] |= (uint8_t) (((nb >> 3) & 0x01) << bit);
+                            cur->signs[4 * sb + 2 + e / 2] |= (uint8_t) (((nb >> 7) & 0x01) << bit);
+                        }
+                        const int ilo = rev.idx[key_lo];
+                        const int ihi = rev.idx[key_hi];
+                        GGML_ASSERT(ilo >= 0 && ihi >= 0);
+
+                        cur->qs[8 * sb + e] = (uint8_t) (ilo & 0xFF);
+                        cur->qs[8 * sb + e + 4] = (uint8_t) (ihi & 0xFF);
+                        cur->qh[sb] |= (uint8_t) (((ilo >> 8) & 0x01) << (e + 0));
+                        cur->qh[sb] |= (uint8_t) (((ihi >> 8) & 0x01) << (e + 4));
+                    }
+                }
+            }
+
+            for (int r = 0; r < nrows_interleaved; r++) {
+                dst[(b + r) * nblocks + x] = tmp[r];
+            }
+        }
     }
     return 0;
 }
@@ -4546,6 +4757,92 @@ static int repack_mxfp4_to_mxfp4_8_bl(struct ggml_tensor * t, int interleave_blo
     GGML_UNUSED(data_size);
 }
 
+// inverse of repack_mxfp4_to_mxfp4_4_bl, the packed layout is the plain blocks reordered
+static int derepack_mxfp4_from_mxfp4_4_bl(const struct ggml_tensor * t, void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_MXFP4);
+
+    const block_mxfp4x4 * src = (const block_mxfp4x4 *) t->data;
+          block_mxfp4   * dst = (      block_mxfp4   *) data;
+
+    const int nrow = ggml_nrows(t);
+    const int nrows_interleaved = 4;
+    const int nblocks = t->ne[0] / QK_MXFP4;
+
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_mxfp4));
+
+    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % 8 != 0) {
+        return -1;
+    }
+
+    const int end = QK_MXFP4 * 2 / nrows_interleaved;
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            const block_mxfp4x4 * blk = src++;
+            block_mxfp4 tmp[4];
+
+            for (int r = 0; r < nrows_interleaved; r++) {
+                tmp[r].e = blk->e[r];
+            }
+            for (int i = 0; i < end; i++) {
+                const int src_id     = i % nrows_interleaved;
+                const int src_offset = (i / nrows_interleaved) * nrows_interleaved;
+                const int dst_offset = i * nrows_interleaved;
+
+                memcpy(&tmp[src_id].qs[src_offset], &blk->qs[dst_offset], sizeof(uint32_t));
+            }
+
+            for (int r = 0; r < nrows_interleaved; r++) {
+                dst[(b + r) * nblocks + x] = tmp[r];
+            }
+        }
+    }
+    return 0;
+}
+
+// inverse of repack_mxfp4_to_mxfp4_8_bl, the packed layout is the plain blocks reordered
+static int derepack_mxfp4_from_mxfp4_8_bl(const struct ggml_tensor * t, void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_MXFP4);
+
+    const block_mxfp4x8 * src = (const block_mxfp4x8 *) t->data;
+          block_mxfp4   * dst = (      block_mxfp4   *) data;
+
+    const int nrow = ggml_nrows(t);
+    const int nrows_interleaved = 8;
+    const int nblocks = t->ne[0] / QK_MXFP4;
+
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_mxfp4));
+
+    if (t->ne[1] % nrows_interleaved != 0) {
+        return -1;
+    }
+
+    const int end = QK_MXFP4 * 4 / nrows_interleaved;
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            const block_mxfp4x8 * blk = src++;
+            block_mxfp4 tmp[8];
+
+            for (int r = 0; r < nrows_interleaved; r++) {
+                tmp[r].e = blk->e[r];
+            }
+            for (int i = 0; i < end; i++) {
+                const int src_id     = i % nrows_interleaved;
+                const int src_offset = (i / nrows_interleaved) * nrows_interleaved;
+                const int dst_offset = i * nrows_interleaved;
+
+                memcpy(&tmp[src_id].qs[src_offset], &blk->qs[dst_offset], sizeof(uint64_t));
+            }
+
+            for (int r = 0; r < nrows_interleaved; r++) {
+                dst[(b + r) * nblocks + x] = tmp[r];
+            }
+        }
+    }
+    return 0;
+}
+
 namespace ggml::cpu::repack {
 // repack
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
@@ -4635,6 +4932,36 @@ template <> int repack<block_q8_0, 4, 4>(struct ggml_tensor * t, const void * da
 
 template <> int repack<block_q8_0, 8, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q8_0_to_q8_0_4_bl(t, 8, data, data_size);
+}
+
+// derepack: decode one plane of the packed layout back to the plain layout, -1 if the type has no inverse
+template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
+int derepack(const struct ggml_tensor *, void *, size_t) {
+    return -1;
+}
+
+template <> int derepack<block_iq4_xs, 8, 8>(const struct ggml_tensor * t, void * data, size_t data_size) {
+    return derepack_iq4_xs_from_iq4_xs_8_bl(t, data, data_size);
+}
+
+template <> int derepack<block_iq3_s, 8, 8>(const struct ggml_tensor * t, void * data, size_t data_size) {
+    return derepack_iq3_s_from_iq3_s_8_bl(t, data, data_size);
+}
+
+template <> int derepack<block_mxfp4, 4, 4>(const struct ggml_tensor * t, void * data, size_t data_size) {
+    return derepack_mxfp4_from_mxfp4_4_bl(t, data, data_size);
+}
+
+template <> int derepack<block_mxfp4, 8, 8>(const struct ggml_tensor * t, void * data, size_t data_size) {
+    return derepack_mxfp4_from_mxfp4_8_bl(t, data, data_size);
+}
+
+template <> int derepack<block_q6_K, 8, 8>(const struct ggml_tensor * t, void * data, size_t data_size) {
+    return derepack_q6_K_from_q6_K_8_bl(t, 8, data, data_size);
+}
+
+template <> int derepack<block_q6_K, 4, 8>(const struct ggml_tensor * t, void * data, size_t data_size) {
+    return derepack_q6_K_from_q6_K_8_bl(t, 4, data, data_size);
 }
 
 #if defined __riscv_zvfh
@@ -4934,6 +5261,9 @@ static inline void repack_act_row_to_x4(uint8_t * dst_group, const uint8_t * src
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
+
+    // decode one plane of the packed layout back to the plain layout, -1 if the type has no inverse
+    virtual int derepack(const struct ggml_tensor * t, void * data, size_t data_size) const = 0;
 
     // the packed layout interleaves NB_COLS rows, so a row stride only makes sense on those groups
     virtual size_t repacked_row_bytes(const struct ggml_tensor * t) const = 0;
@@ -5541,6 +5871,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         return ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
     }
 
+    int derepack(const struct ggml_tensor * t, void * data, size_t data_size) const override {
+        return ggml::cpu::repack::derepack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
+    }
+
     size_t repacked_row_bytes(const struct ggml_tensor * t) const override {
         const size_t nblocks = ggml_row_size(t->type, t->ne[0]) / sizeof(BLOC_TYPE);
         return nblocks * repacked_block_size<BLOC_TYPE, NB_COLS>() / NB_COLS;
@@ -5951,6 +6285,29 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
     }
 };
 }  // namespace ggml::cpu::repack
+
+bool ggml_backend_cpu_repack_derepack(const struct ggml_tensor * tensor, int64_t plane, void * data) {
+    if (tensor == nullptr || tensor->buffer == nullptr || data == nullptr || tensor->extra == nullptr) {
+        return false;
+    }
+    // other extra buffer types (AMX, KleidiAI) also store their traits in extra
+    if (ggml_backend_buffer_get_type(tensor->buffer) != ggml_backend_cpu_repack_buffer_type()) {
+        return false;
+    }
+    if (plane < 0 || plane >= tensor->ne[2]) {
+        return false;
+    }
+
+    const auto * traits = (const ggml::cpu::repack::tensor_traits_base *) tensor->extra;
+    const size_t plain_plane = ggml_row_size(tensor->type, tensor->ne[0]) * (size_t) tensor->ne[1];
+
+    ggml_tensor tmp = *tensor;
+    tmp.data  = (uint8_t *) tensor->data + (size_t) plane * tensor->nb[2];
+    tmp.ne[2] = 1;
+    tmp.ne[3] = 1;
+
+    return traits->derepack(&tmp, data, plain_plane) == 0;
+}
 
 ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
     static struct ggml_backend_buffer_type ggml_backend_cpu_buffer_type_repack = {

@@ -565,7 +565,15 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, (int32_t) cparams.n_ubatch);
+            if (model.has_deferred_moe_experts()) {
+                LLAMA_LOG_INFO("%s: MoE cache active, the context keeps the experts that are not in the cache in host memory only\n", __func__);
+            } else {
+                LLAMA_LOG_WARN("%s: MoE cache is enabled but the model keeps a host copy of the experts, the cache uses extra host memory\n", __func__);
+            }
+            if (model.split_mode() != LLAMA_SPLIT_MODE_LAYER) {
+                LLAMA_LOG_WARN("%s: the MoE cache is designed for layer split, the placement may be worse with another split mode\n", __func__);
+            }
         } else if (model.has_deferred_moe_experts()) {
             // the model was loaded for the MoE cache and keeps no host copy of the experts
             throw std::runtime_error("the model was loaded with a MoE cache, the context must enable it too (moe_cache_size)");
@@ -735,6 +743,15 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+
+    // opt-in: run the CPU misses of a cached layer while the device computes its cached experts.
+    // measured slightly slower on the GPUs tested (the per split worker handoff costs more than the
+    // overlap saves), so it is off by default and LLAMA_MOE_CACHE_OVERLAP=1 enables it
+    if (moe_cache != nullptr) {
+        const char * env = getenv("LLAMA_MOE_CACHE_OVERLAP");
+        const bool overlap = env != nullptr && *env != '\0' && atoi(env) != 0;
+        ggml_backend_sched_set_cpu_overlap(sched.get(), overlap);
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -896,6 +913,8 @@ void llama_context::sched_reserve() {
 void llama_context::moe_cache_rebalance() {
     // only when the master context exists and the cache is enabled
     if (sched && moe_cache) {
+        // the placement must not move while work is in flight
+        synchronize();
         moe_cache->rebalance();
     }
 }
@@ -903,8 +922,19 @@ void llama_context::moe_cache_rebalance() {
 void llama_context::moe_cache_rebalance_idle() {
     // only when the master context exists and the cache is enabled
     if (sched && moe_cache) {
+        // the placement must not move while work is in flight
+        synchronize();
         moe_cache->rebalance_idle();
     }
+}
+
+llama_moe_cache_stats llama_context::moe_cache_stats() {
+    if (!moe_cache) {
+        llama_moe_cache_stats res = {};
+        res.enabled = false;
+        return res;
+    }
+    return moe_cache->stats();
 }
 
 void llama_context::synchronize() {
@@ -1490,6 +1520,16 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
 
     if (adapters_lora_are_same(adapters, n_adapters, scales)) {
         return;
+    }
+
+    bool has_lora = false;
+    for (size_t i = 0; i < n_adapters; i++) {
+        has_lora = has_lora || scales[i] != 0.0f;
+    }
+    if (has_lora && moe_cache && model.has_deferred_moe_experts()) {
+        // the cache of a deferred model keeps only the experts that are not on the device,
+        // the LoRA delta of a cached expert cannot be applied to the bank
+        throw std::runtime_error("MoE cache does not support LoRA with the experts kept in host memory by the cache");
     }
 
     loras.reset(new llama_adapter_loras());
@@ -2589,8 +2629,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     }
 
     if (moe_cache) {
-        // the MoE cache builds the expert FFN of each cached layer twice plus the slot expression
-        res += 64u * model.hparams.n_layer_all;
+        // the MoE cache builds the expert FFN of each cached layer twice plus the slot expression,
+        // the usage copy and the extra add of the two expert halves
+        res += 72u * model.hparams.n_layer_all;
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
@@ -2806,7 +2847,7 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
-    // complete the pending usage reads of the MoE cache and rebalance it while the device is idle
+    // complete the pending usage reads of the MoE cache
     if (moe_cache) {
         moe_cache->begin();
     }
@@ -2816,6 +2857,11 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
+    // queue the readback of the selected experts, the counters are applied by the next begin()
+    if (moe_cache) {
+        moe_cache->end(gf);
+    }
+
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
@@ -2823,11 +2869,6 @@ ggml_status llama_context::graph_compute(
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
-
-    // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
-        return true;
-    }
 
     auto & st = lctx->copy_experts;
 
@@ -4266,6 +4307,10 @@ void llama_moe_cache_rebalance(llama_context * ctx) {
 
 void llama_moe_cache_rebalance_idle(llama_context * ctx) {
     ctx->moe_cache_rebalance_idle();
+}
+
+struct llama_moe_cache_stats llama_moe_cache_get_stats(llama_context * ctx) {
+    return ctx->moe_cache_stats();
 }
 
 float * llama_get_logits(llama_context * ctx) {

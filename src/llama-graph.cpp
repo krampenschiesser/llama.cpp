@@ -1791,7 +1791,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : (w_host ? w_host : w), cur_mm, slots);
 
     if (prec_policy) {
-        prec_policy->apply(res);
+        // the weight of the op can be a bank of the MoE cache, the policy is keyed by the model tensor
+        prec_policy->apply(res, w);
     }
 
     if (w->type == GGML_TYPE_NVFP4) {
@@ -2613,21 +2614,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // the device part is not available, e.g. the warmup selects all experts: compute the misses on the CPU
         experts = build_experts(cur, selected_experts, cache_slots.cpu_ids, false);
     } else {
-        // the device computes the cached experts and the CPU the misses, each part reads the other as zero
+        // the device computes the cached experts and the CPU the misses, each part reads the other as zero.
+        // the misses are built first, so a scheduler with CPU overlap can run them while the device
+        // computes the cached experts
         GGML_ASSERT(cache_slots.cpu_ids != nullptr);
 
-        ggml_tensor * experts_dev = build_experts(cur, selected_experts, cache_slots.slots, true);
-        ggml_build_forward_expand(gf, experts_dev);
-
-        const int n_nodes_dev = ggml_graph_n_nodes(gf);
+        const int n_nodes_cpu = ggml_graph_n_nodes(gf);
         ggml_tensor * experts_cpu = build_experts(cur, selected_experts, cache_slots.cpu_ids, false);
         ggml_build_forward_expand(gf, experts_cpu);
-        for (int i = n_nodes_dev; i < ggml_graph_n_nodes(gf); ++i) {
+        for (int i = n_nodes_cpu; i < ggml_graph_n_nodes(gf); ++i) {
             ggml_tensor * node = ggml_graph_node(gf, i);
             if (node->view_src == nullptr) {
                 ggml_backend_sched_set_tensor_backend(sched, node, backend_cpu);
             }
         }
+
+        ggml_tensor * experts_dev = build_experts(cur, selected_experts, cache_slots.slots, true);
+        ggml_build_forward_expand(gf, experts_dev);
 
         experts = ggml_add(ctx0, experts_dev, experts_cpu);
         ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->get_layer(il)->backend);
@@ -2746,9 +2749,14 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     if (selected_experts->ne[1] == 0) {
         return res;
     }
-    // the warmup runs with all experts selected and the misses would not fit in the zero slots
+    // the cache sizes the zero rows for the number of experts a token selects. a graph that selects
+    // more, e.g. a warmup with all experts, cannot be computed by a layer without a full host copy
     if (selected_experts->ne[0] > layer->n_zero) {
-        return reduced ? build_cpu_ids() : res;
+        if (reduced) {
+            throw std::runtime_error(std::string("MoE cache: layer ") + std::to_string(il) +
+                    " selects more experts than the zero rows of the cache, this graph cannot compute it");
+        }
+        return res;
     }
     for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
         if (w == nullptr) {
@@ -2757,14 +2765,9 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         if (moe_cache->get_experts(w) == nullptr) {
             return fallback();
         }
-        // the transform of a Hadamard-folded weight reads host weights before the slot lookup starts its split
-        if (hdmd != nullptr && hdmd->rot.count(w) > 0) {
-            return fallback();
-        }
     }
 
-    // the slot map is a host weight: the scheduler starts a new split at the lookup and copies it with the copy callback
-    // the callback reads the selected experts and records them for the usage counters
+    // the slot map is a device weight, the lookup runs on the device without a copy
     ggml_tensor * cached = ggml_get_rows(ctx0, layer->slot_map, ids); // I32 [1, n_used*n_tokens]: slot + 1 if cached, 0 if a miss
 
     // the cached experts read their slot, the misses read the zero slots at the end of the banks
@@ -2785,7 +2788,8 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         }
     }
 
-    // the ids are computed in an earlier split: the copy callback of the scheduler reads them async
+    // the ids are computed in an earlier split. the graph copies them into the usage buffer of the
+    // cache, the cache reads them back after the compute
     ggml_build_forward_expand(gf, ids);
     const int n_nodes = ggml_graph_n_nodes(gf);
     ggml_build_forward_expand(gf, slots);
@@ -2796,6 +2800,14 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
         }
     }
     cb(slots, "ffn_moe_slots", il);
+
+    ggml_tensor * usage = moe_cache->get_usage(ctx0, gf, il, n_used, n_tokens);
+    if (usage != nullptr) {
+        ggml_tensor * usage_cpy = ggml_cpy(ctx0, ids, usage);
+        ggml_backend_sched_set_tensor_backend(sched, usage_cpy, layer->backend);
+        ggml_build_forward_expand(gf, usage_cpy);
+        cb(usage_cpy, "ffn_moe_usage", il);
+    }
 
     res.cpu_ids = build_cpu_ids().cpu_ids;
     res.slots   = slots;

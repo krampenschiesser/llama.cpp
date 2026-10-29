@@ -1304,6 +1304,20 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
 
+                        // the placement changes after a rebalance must not change the output
+                        if (!encode && dc.moe_cache_size > 0 && llama_get_memory(model_and_ctx_dev.second.get()) != nullptr) {
+                            llama_moe_cache_rebalance(model_and_ctx_dev.second.get());
+                            llama_moe_cache_rebalance_idle(model_and_ctx_dev.second.get());
+                            llama_memory_clear(llama_get_memory(model_and_ctx_dev.second.get()), true);
+                            const std::vector<float> logits_after = get_logits(
+                                model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
+                            const double nmse_after = nmse(logits_dev, logits_after);
+                            if (nmse_after > 1e-4) {
+                                test_ok = false;
+                                status_nmse = "\033[1;31mFAIL\033[0m (rebalance)";
+                            }
+                        }
+
                         // chunked decode matches a single batch only with causal attention over a memory
                         llama_context * lctx_dev = model_and_ctx_dev.second.get();
                         if (!encode && llama_get_memory(lctx_dev) != nullptr) {

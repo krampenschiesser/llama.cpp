@@ -1450,12 +1450,13 @@ struct llama_model::impl {
     std::unordered_set<const ggml_tensor *> moe_deferred;
 };
 
-bool llama_prec_policy::apply(ggml_tensor * res) const {
-    if (!res || !res->src[0]) {
+bool llama_prec_policy::apply(ggml_tensor * res, const ggml_tensor * w) const {
+    if (!res || (!w && !res->src[0])) {
         return false;
     }
 
-    const auto it = prec_src1.find(res->src[0]);
+    const ggml_tensor * key = w != nullptr ? w : res->src[0];
+    const auto it = prec_src1.find(key);
     if (it == prec_src1.end()) {
         return false;
     }

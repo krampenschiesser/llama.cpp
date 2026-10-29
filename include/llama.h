@@ -1145,13 +1145,31 @@ extern "C" {
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
 
     // Apply the MoE cache usage counters and move the most used experts to the device cache.
-    // Call only when no work is in flight, e.g. when all inference slots are idle or released.
+    // Waits for the pending work of the context, the placement must not move while work is in flight.
     // No-op if the model has no MoE cache. [EXPERIMENTAL]
     // applies the MoE cache usage counters, e.g. after prompt processing and before the decode
     LLAMA_API void llama_moe_cache_rebalance(struct llama_context * ctx);
 
     // same, but only for the layers that collected enough selections, e.g. while the server is idle
     LLAMA_API void llama_moe_cache_rebalance_idle(struct llama_context * ctx);
+
+    // Usage counters and memory of the MoE cache of the context, enabled is false without a cache
+    struct llama_moe_cache_stats {
+        bool     enabled;
+        int32_t  n_layers_cached;  // MoE layers that keep experts on a device
+        int32_t  n_experts_cached; // experts that are in the device cache
+        uint64_t n_selected;       // selected experts counted so far
+        uint64_t n_hits;           // selections served by the device cache
+        uint64_t n_misses;         // selections computed on the CPU
+        uint64_t n_rebalances;
+        uint64_t n_promoted;       // experts moved to the device cache
+        size_t   bytes_device;     // device memory of the cache
+        size_t   bytes_host;       // host memory of the cache
+        size_t   bytes_uploaded;   // bytes read from the model or moved between the banks
+        size_t   bytes_promoted;
+    };
+
+    LLAMA_API struct llama_moe_cache_stats llama_moe_cache_get_stats(struct llama_context * ctx);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously

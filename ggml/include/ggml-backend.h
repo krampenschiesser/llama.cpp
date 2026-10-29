@@ -378,6 +378,11 @@ extern "C" {
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 
+    // Run a host split on a worker thread while the next split runs on the device.
+    // Only enabled when the scheduler has a single copy buffer. The scheduler joins the worker
+    // before any split that reads its results.
+    GGML_API void                 ggml_backend_sched_set_cpu_overlap(ggml_backend_sched_t sched, bool enable);
+
     //
     // Meta backend
     //

@@ -2498,6 +2498,14 @@ int llama_bench(int argc, char ** argv) {
 
             // no work is in flight: apply the MoE cache usage counters from the warmup, no-op without a cache
             llama_moe_cache_rebalance(ctx);
+            const llama_moe_cache_stats moe_stats = llama_moe_cache_get_stats(ctx);
+            if (moe_stats.enabled) {
+                fprintf(stderr, "%s: MoE cache: %d layers, %d experts on the device (%.2f MiB), %.2f MiB host, "
+                        "%" PRIu64 " selections, %" PRIu64 " hits, %" PRIu64 " misses, %" PRIu64 " rebalances\n",
+                        __func__, moe_stats.n_layers_cached, moe_stats.n_experts_cached, moe_stats.bytes_device/1024.0/1024.0,
+                        moe_stats.bytes_host/1024.0/1024.0, moe_stats.n_selected, moe_stats.n_hits, moe_stats.n_misses,
+                        moe_stats.n_rebalances);
+            }
         }
 
         for (int i = 0; i < params.reps; i++) {

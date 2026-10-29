@@ -1045,7 +1045,7 @@ struct llm_graph_amax_src1 {
 // the ids that select the experts of a MoE layer in the MoE cache
 struct llm_graph_moe_cache_slots {
     ggml_tensor * slots;   // [n_expert_used, n_tokens] bank row of the cached experts, n_cached_experts_per_layer + k for the misses
-    ggml_tensor * cpu_ids; // [n_expert_used, n_tokens] expert id of the misses, -1 for the cached experts
+    ggml_tensor * cpu_ids; // [n_expert_used, n_tokens] host slot of the misses, or the expert id when the model owns the host copy, -1 for the cached experts
 };
 
 struct llm_graph_context {

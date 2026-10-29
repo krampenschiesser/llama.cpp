@@ -64,6 +64,7 @@ struct llama_context {
     // see llama_moe_cache_rebalance()
     void moe_cache_rebalance();
     void moe_cache_rebalance_idle();
+    llama_moe_cache_stats moe_cache_stats();
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -281,7 +282,7 @@ private:
     // create a new backend scheduler for a graph of the specified size and register the callbacks below
     void sched_new(size_t max_nodes, bool parallel);
 
-    // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+    // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID from a host expert tensor
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
