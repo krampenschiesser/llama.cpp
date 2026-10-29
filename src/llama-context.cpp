@@ -744,17 +744,14 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
-    // the MoE cache splits every cached layer into a CPU half and a device half, both can run at the same
-    // time: the copies cross backends asynchronously and the host split runs on a worker thread.
-    // opt-in for now, the pipeline is not correct yet with every device configuration
+    // the MoE cache splits every cached layer into a CPU half and a device half, both run at the same time:
+    // the copies cross backends asynchronously and the host split runs on a worker thread.
+    // LLAMA_MOE_CACHE_PIPE is a bit mask, 1 = async copies, 2 = worker, 3 = both (default), 0 = off
     if (moe_cache != nullptr) {
         const char * env = getenv("LLAMA_MOE_CACHE_PIPE");
-        const bool pipe = env != nullptr && *env != '\0' && atoi(env) != 0;
-        ggml_backend_sched_set_async_copies(sched.get(), pipe);
-        ggml_backend_sched_set_cpu_overlap(sched.get(), pipe);
-        if (pipe) {
-            LLAMA_LOG_WARN("%s: MoE cache pipeline enabled, CUDA graphs must be disabled (GGML_CUDA_DISABLE_GRAPHS=1)\n", __func__);
-        }
+        const int pipe = env != nullptr && *env != '\0' ? atoi(env) : 3;
+        ggml_backend_sched_set_async_copies(sched.get(), (pipe & 1) != 0);
+        ggml_backend_sched_set_cpu_overlap(sched.get(), (pipe & 2) != 0);
     }
 }
 
