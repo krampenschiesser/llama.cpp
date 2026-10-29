@@ -934,6 +934,8 @@ llama_moe_cache_stats llama_context::moe_cache_stats() {
         res.enabled = false;
         return res;
     }
+    // apply the selections that are still in flight so the stats are exact
+    moe_cache->finish();
     return moe_cache->stats();
 }
 
@@ -1618,6 +1620,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        if (moe_cache) {
+            moe_cache->new_graph();
+        }
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -2752,6 +2757,9 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
+    if (moe_cache) {
+        moe_cache->new_graph();
+    }
     auto * gf = model.build_graph(gparams);
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
@@ -2847,17 +2855,12 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
-    // complete the pending usage reads of the MoE cache
-    if (moe_cache) {
-        moe_cache->begin();
-    }
-
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // queue the readback of the selected experts, the counters are applied by the next begin()
+    // queue the readback of the selected experts, the counters are applied by end() or finish()
     if (moe_cache) {
         moe_cache->end(gf);
     }
@@ -3967,7 +3970,10 @@ void llama_context::opt_epoch_iter(
             gf_res_prev_active = nullptr;
             res->reset();
 
-            auto * gf = model.build_graph(gparams);
+            if (moe_cache) {
+        moe_cache->new_graph();
+    }
+    auto * gf = model.build_graph(gparams);
 
             struct ggml_context * ctx_compute_opt;
             {

@@ -3695,19 +3695,24 @@ private:
             }
         }
 
-        // no work is queued for the devices here: place the experts with the prompt usage before the decode
+        // no work is queued for the devices here: place the experts with the prompt usage before the decode.
+        // a short prompt is too few samples to replace the placement, its counts wait for the idle rebalance
         if (moe_rebalance_pending) {
             moe_rebalance_pending = false;
 
-            SRV_INF("moe cache: rebalance after prompt processing, %" PRId64 " prompt tokens\n", moe_rebalance_n_prompt);
-            moe_rebalance_n_prompt = 0;
+            if (moe_rebalance_n_prompt >= 128) {
+                SRV_INF("moe cache: rebalance after prompt processing, %" PRId64 " prompt tokens\n", moe_rebalance_n_prompt);
 
-            if (ctx_tgt != nullptr) {
-                llama_moe_cache_rebalance(ctx_tgt);
+                if (ctx_tgt != nullptr) {
+                    llama_moe_cache_rebalance(ctx_tgt);
+                }
+                if (ctx_dft != nullptr) {
+                    llama_moe_cache_rebalance(ctx_dft);
+                }
+            } else {
+                SRV_DBG("moe cache: %" PRId64 " prompt tokens, the placement waits for the idle rebalance\n", moe_rebalance_n_prompt);
             }
-            if (ctx_dft != nullptr) {
-                llama_moe_cache_rebalance(ctx_dft);
-            }
+            moe_rebalance_n_prompt = 0;
         }
     }
 

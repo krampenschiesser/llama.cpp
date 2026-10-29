@@ -1786,9 +1786,12 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // the experts in the MoE cache are selected by their slots
     // the cache may own the host copy of the experts, the model tensors then hold no data
     ggml_tensor * w_host = moe_cache ? moe_cache->get_host_experts(w) : nullptr;
+    // a layer that the cache holds in full is a plain device FFN with the expert ids
+    ggml_tensor * w_full = moe_cache ? moe_cache->get_full_experts(w) : nullptr;
+    ggml_tensor * w_dev  = cached && moe_cache ? moe_cache->get_experts(w) : nullptr;
     ggml_tensor * res = slots == nullptr ?
-        ggml_mul_mat_id(ctx0, w_host ? w_host : w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : (w_host ? w_host : w), cur_mm, slots);
+        ggml_mul_mat_id(ctx0, w_full ? w_full : (w_host ? w_host : w), cur_mm, ids) :
+        ggml_mul_mat_id(ctx0, w_dev ? w_dev : (w_host ? w_host : w), cur_mm, slots);
 
     if (prec_policy) {
         // the weight of the op can be a bank of the MoE cache, the policy is keyed by the model tensor
@@ -2768,21 +2771,20 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     }
 
     // the slot map is a device weight, the lookup runs on the device without a copy
-    ggml_tensor * cached = ggml_get_rows(ctx0, layer->slot_map, ids); // I32 [1, n_used*n_tokens]: slot + 1 if cached, 0 if a miss
+    ggml_tensor * cached = ggml_get_rows(ctx0, layer->slot_map, ids); // F32 [1, n_used*n_tokens]: slot + 1 if cached, 0 if a miss
 
     // the cached experts read their slot, the misses read the zero slots at the end of the banks
     // each expert position k of a token reads its own zero slot: mul_mat_id needs distinct ids within a token
-    ggml_tensor * cf_f  = ggml_cast(ctx0, cached, GGML_TYPE_F32);
-    ggml_tensor * cf    = ggml_reshape_2d(ctx0, cf_f, n_used, n_tokens);
+    ggml_tensor * cf    = ggml_reshape_2d(ctx0, cached, n_used, n_tokens);
     ggml_tensor * hit   = ggml_step(ctx0, cf); // 1 if cached, 0 if a miss
-    ggml_tensor * k     = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_used, 1.0f), n_used, 1);
+    ggml_tensor * k     = ggml_view_1d(ctx0, layer->k_base, n_used, 0); // expert position, 0..n_used-1
     ggml_tensor * k_rep = ggml_repeat_4d(ctx0, k, n_used, n_tokens, 1, 1);
     ggml_tensor * z     = ggml_scale_bias(ctx0, k_rep, 1.0f, (float) n_cached_experts_per_layer); // n_cached_experts_per_layer + k
-    ggml_tensor * d     = ggml_scale_bias(ctx0, ggml_sub(ctx0, cf, z), 1.0f, -1.0f); // cf - z - 1
-    ggml_tensor * sum   = ggml_add(ctx0, z, ggml_mul(ctx0, hit, d));
+    // cf - 1 for a cached expert, n_cached_experts_per_layer + k for a miss
+    ggml_tensor * sum   = ggml_sub(ctx0, ggml_add(ctx0, z, ggml_mul(ctx0, hit, ggml_sub(ctx0, cf, z))), hit);
     ggml_tensor * slots = ggml_cast(ctx0, sum, GGML_TYPE_I32); // [n_used, n_tokens]
 
-    for (ggml_tensor * t : { cached, cf_f, hit, k, k_rep, z, d, sum, slots }) {
+    for (ggml_tensor * t : { cached, cf, hit, k, k_rep, z, sum, slots }) {
         if (!ggml_backend_supports_op(layer->backend, t)) {
             return fallback();
         }
