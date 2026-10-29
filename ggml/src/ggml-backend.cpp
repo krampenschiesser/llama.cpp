@@ -930,6 +930,10 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// device to host copy on a stream of the backend that does not stop the compute stream
+typedef bool (*ggml_backend_copy_d2h_fn)(ggml_backend_t backend, const struct ggml_tensor * src, void * dst, size_t size,
+        ggml_backend_event_t after, ggml_backend_event_t done);
+
 // pinned host buffers for the asynchronous split input copies, one bump allocator per source backend
 // the buffers live until the scheduler is freed, the allocation offset is reset on each graph split
 struct ggml_backend_sched_pinned {
@@ -1028,6 +1032,10 @@ struct ggml_backend_sched {
     // copy event of each split, waited before the split runs
     ggml_backend_event_t * split_events; // [splits_capacity]
     ggml_backend_dev_t    * split_event_devs; // [splits_capacity]
+    // compute stream position before the copy of a split, for the copies on a second stream
+    ggml_backend_event_t * split_afters; // [splits_capacity]
+    ggml_backend_dev_t    * split_after_devs; // [splits_capacity]
+    ggml_backend_copy_d2h_fn copy_d2h[GGML_SCHED_MAX_BACKENDS];
 
     // counters of the last compute, for the debug output
     int n_sync_copies;
@@ -1325,6 +1333,23 @@ static void ggml_backend_sched_pinned_alloc(ggml_backend_sched_t sched, int src_
     t->data   = ggml_backend_buffer_get_base(p.bufs[idx]);
     ggml_set_input(t);
     ggml_set_output(t); // prevent ggml-alloc from overwriting the tensor
+}
+
+// the position of the compute stream before the copy of a split
+static ggml_backend_event_t ggml_backend_sched_split_after(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, ggml_backend_dev_t dev) {
+    const int split_id = (int) (split - sched->splits);
+    GGML_ASSERT(split_id >= 0 && split_id < sched->splits_capacity);
+    GGML_ASSERT(sched->split_afters != NULL);
+
+    if (sched->split_afters[split_id] != NULL && sched->split_after_devs[split_id] != dev) {
+        ggml_backend_event_free(sched->split_afters[split_id]);
+        sched->split_afters[split_id] = NULL;
+    }
+    if (sched->split_afters[split_id] == NULL) {
+        sched->split_afters[split_id] = ggml_backend_event_new(dev);
+        sched->split_after_devs[split_id] = dev;
+    }
+    return sched->split_afters[split_id];
 }
 
 // the copy event of a split, created on the device of the asynchronous copy
@@ -1650,9 +1675,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     sched->split_event_devs = (ggml_backend_dev_t *) realloc(sched->split_event_devs,
                             sched->splits_capacity * sizeof(sched->split_event_devs[0]));
                     GGML_ASSERT(sched->split_events != NULL && sched->split_event_devs != NULL);
+                    sched->split_afters = (ggml_backend_event_t *) realloc(sched->split_afters,
+                            sched->splits_capacity * sizeof(sched->split_afters[0]));
+                    sched->split_after_devs = (ggml_backend_dev_t *) realloc(sched->split_after_devs,
+                            sched->splits_capacity * sizeof(sched->split_after_devs[0]));
+                    GGML_ASSERT(sched->split_afters != NULL && sched->split_after_devs != NULL);
                     for (int k = old_cap; k < sched->splits_capacity; k++) {
                         sched->split_events[k]     = NULL;
                         sched->split_event_devs[k] = NULL;
+                        sched->split_afters[k]     = NULL;
+                        sched->split_after_devs[k] = NULL;
                     }
                 }
                 split = &sched->splits[i_split];
@@ -2027,6 +2059,20 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                     input_backend->iface.get_tensor_async != NULL) {
                 ggml_backend_event_t ev = ggml_backend_sched_split_event(sched, split, dev);
                 if (ev != NULL) {
+                    const int input_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
+                    ggml_backend_copy_d2h_fn copy_d2h = input_backend_id >= 0 ? sched->copy_d2h[input_backend_id] : NULL;
+                    if (copy_d2h != NULL) {
+                        // the copy runs on a second stream while the device keeps computing
+                        ggml_backend_event_t after = ggml_backend_sched_split_after(sched, split, dev);
+                        if (after != NULL) {
+                            ggml_backend_event_record(after, input_backend);
+                            if (copy_d2h(input_backend, input, input_cpy->data, ggml_nbytes(input_cpy), after, ev)) {
+                                sched->n_async_copies++;
+                                return;
+                            }
+                        }
+                    }
+                    // no second stream: the copy is ordered on the compute stream
                     ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input_cpy));
                     ggml_backend_event_record(ev, input_backend);
                     sched->n_async_copies++;
@@ -2359,6 +2405,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->splits_capacity = initial_splits_capacity;
     sched->split_events     = (ggml_backend_event_t *) calloc(initial_splits_capacity, sizeof(sched->split_events[0]));
     sched->split_event_devs = (ggml_backend_dev_t *)   calloc(initial_splits_capacity, sizeof(sched->split_event_devs[0]));
+    sched->split_afters     = (ggml_backend_event_t *) calloc(initial_splits_capacity, sizeof(sched->split_afters[0]));
+    sched->split_after_devs = (ggml_backend_dev_t *)   calloc(initial_splits_capacity, sizeof(sched->split_after_devs[0]));
 
     sched->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
     sched->graph_inputs = (struct ggml_tensor **) calloc(sched->graph_inputs_capacity, sizeof(struct ggml_tensor *));
@@ -2372,6 +2420,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
         for (int c = 0; c < sched->n_copies; c++) {
             sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
         }
+
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[b]));
+        sched->copy_d2h[b] = (ggml_backend_copy_d2h_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_d2h");
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
@@ -2401,8 +2452,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->split_events[i]);
         }
     }
+    for (int i = 0; i < sched->splits_capacity; i++) {
+        ggml_backend_event_free(sched->split_afters != NULL ? sched->split_afters[i] : NULL);
+    }
     free(sched->split_events);
     free(sched->split_event_devs);
+    free(sched->split_afters);
+    free(sched->split_after_devs);
     for (int b = 0; b < sched->n_backends; b++) {
         for (size_t i = 0; i < sched->pinned[b].n_bufs; i++) {
             ggml_backend_buffer_free(sched->pinned[b].bufs[i]);

@@ -750,6 +750,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (stream_copy != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(stream_copy));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2756,8 +2759,33 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    if (cuda_ctx->stream_copy != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream_copy));
+    }
 
     GGML_UNUSED(backend);
+}
+
+// device to host copy on a second stream, ordered after `after` and signalised by `done`
+// the caller does not have to stop the compute stream, so it keeps working during the copy
+static bool ggml_backend_cuda_copy_d2h(
+        ggml_backend_t backend, const struct ggml_tensor * src, void * dst, size_t size,
+        ggml_backend_event_t after, ggml_backend_event_t done) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    if (!ggml_backend_is_cuda(backend) || src->data == nullptr || dst == nullptr || size == 0) {
+        return false;
+    }
+    const cudaStream_t stream = cuda_ctx->stream_copy_get();
+
+    if (after != nullptr) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, (cudaEvent_t) after->context, 0));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(dst, src->data, size, cudaMemcpyDeviceToHost, stream));
+    if (done != nullptr) {
+        CUDA_CHECK(cudaEventRecord((cudaEvent_t) done->context, stream));
+    }
+    return true;
 }
 
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
@@ -6405,6 +6433,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_mul_mat_id_skip_negative") == 0) {
         return (void *) ggml_backend_cuda_mul_mat_id_skips_negative;
+    }
+    if (strcmp(name, "ggml_backend_copy_d2h") == 0) {
+        return (void *) ggml_backend_cuda_copy_d2h;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

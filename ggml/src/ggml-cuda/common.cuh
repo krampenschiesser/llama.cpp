@@ -1525,6 +1525,16 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
+    // a second stream for the host copies, so a device to host copy does not stop the compute stream
+    cudaStream_t stream_copy = nullptr;
+    cudaStream_t stream_copy_get() {
+        if (stream_copy == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&stream_copy, cudaStreamNonBlocking));
+        }
+        return stream_copy;
+    }
+
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
     cublasHandle_t cublas_handle() {
