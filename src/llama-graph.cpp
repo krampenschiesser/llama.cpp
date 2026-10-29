@@ -2816,14 +2816,6 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     }
     cb(slots, "ffn_moe_slots", il);
 
-    ggml_tensor * usage = moe_cache->get_usage(ctx0, gf, il, n_used, n_tokens);
-    if (usage != nullptr) {
-        ggml_tensor * usage_cpy = ggml_cpy(ctx0, ids, usage);
-        ggml_backend_sched_set_tensor_backend(sched, usage_cpy, layer->backend);
-        ggml_build_forward_expand(gf, usage_cpy);
-        cb(usage_cpy, "ffn_moe_usage", il);
-    }
-
     res.cpu_ids = build_cpu_ids().cpu_ids;
     res.slots   = slots;
     return res;

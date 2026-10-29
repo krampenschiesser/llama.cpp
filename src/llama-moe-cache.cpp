@@ -221,23 +221,8 @@ struct llama_moe_cache::impl {
         ggml_backend_buffer_ptr buf;
         size_t buf_size = 0;
 
-        // selected experts of the layers of this device, [n_layers*usage_rows_max] I32, one slice per layer
-        ggml_tensor * usage = nullptr;
-        int32_t usage_n_layers = 0;
-        std::vector<int32_t> usage_layers; // layer id of each slice of the usage buffer
-        size_t  usage_bytes = 0; // bytes of the buffer read back by one graph
-
         // expert position of the slot expression, [n_used_max] F32
         ggml_tensor * k_base = nullptr;
-
-        // host slab that receives the usage ids of the graphs in flight, one fixed slot per queued graph
-        ggml_backend_buffer_ptr read_slab;
-        size_t read_stride = 0;             // bytes of one slot, padded
-        std::vector<ggml_backend_event_t> read_ev; // one event per slot
-        std::vector<int32_t> read_free;     // indices of the free slots
-        std::vector<int32_t> read_rows_cur; // rows of the current graph, by usage slice
-        std::vector<uint8_t> read_data;     // host copy when the device has no host buffer
-        static constexpr int32_t read_n_slots = 8; // graphs in flight before the queue is drained early
     };
 
     // host storage of the experts that are not in the device cache, owned by the cache
@@ -265,9 +250,6 @@ struct llama_moe_cache::impl {
 
         ggml_tensor * slot_map = nullptr; // F32 [1, n_expert] in device memory, slot + 1 if cached
         ggml_tensor * cpu_map  = nullptr; // I32 [1, n_expert] in host memory, host slot if not cached
-
-        // slice of the usage buffer of the device, -1 if the layer has no usage buffer
-        int32_t usage_idx = -1;
 
         std::vector<int32_t> slot_of;      // [n_expert] device slot of the cached experts, -1 if not cached
         std::vector<int32_t> host_slot_of; // [n_expert] host slot of the experts not cached on a device
@@ -319,9 +301,8 @@ struct llama_moe_cache::impl {
     const llama_model & model;
     size_t size;                  // device budget
     size_t read_alignment = 1;    // alignment of the plain reads
-    int32_t n_ubatch = 0;         // max tokens of a graph, sizes the usage buffers
+    int32_t n_ubatch = 0;         // max tokens of a graph, kept for the sizes of the cache
     int32_t n_used_max = 0;       // expert selections of a token, model wide
-    int32_t usage_rows_max = 0;   // n_used_max*n_ubatch, rows of one layer slice of the usage buffer
 
     std::vector<device> devices;
     std::vector<layer> layers;
@@ -335,30 +316,8 @@ struct llama_moe_cache::impl {
     // ranking counters, one per expert, they keep a long history
     std::vector<std::vector<uint64_t>> usage;
 
-    // one graph of usage ids in flight: which device, which readback slot, and the rows of its slices
-    struct usage_record {
-        int32_t dev;
-        int32_t slot;
-        std::vector<int32_t> rows;
-    };
-    std::mutex usage_mutex;             // end() pushes, the placement and the stats drain
-    std::vector<usage_record> usage_queue;
-
-    // selected experts of the graph being built or of the last built graph, per layer
-    mutable std::vector<int32_t> build_rows;
-    mutable std::vector<int32_t> last_rows;
-    mutable ggml_cgraph * last_gf  = nullptr;
-    mutable ggml_cgraph * build_gf = nullptr;
-    mutable bool          building = false;
-
-    // optional per graph trace of the bookkeeping cost, see LLAMA_MOE_CACHE_TRACE. it stays in the
-    // released code to keep the cost of the cache measurable
+    // optional trace of the counting cost, see LLAMA_MOE_CACHE_TRACE
     bool     trace = false;
-    uint64_t trace_graphs = 0;
-    uint64_t trace_calls  = 0;
-    uint64_t trace_bytes  = 0;
-    uint64_t trace_rows   = 0;
-    int64_t  trace_end_us = 0;
     int64_t  trace_count_us = 0;
 
     // maps in host memory
@@ -410,7 +369,6 @@ struct llama_moe_cache::impl {
         max_promote_us     = llama_moe_cache_max_promote_us();
 
         n_used_max     = std::max<int32_t>(1, (int32_t) model.hparams.n_expert_used_max());
-        usage_rows_max = n_used_max*n_ubatch;
         trace          = getenv("LLAMA_MOE_CACHE_TRACE") != nullptr;
 
         // the CPU backend can only be a cache device for tests, the real cache needs a GPU
@@ -703,6 +661,7 @@ struct llama_moe_cache::impl {
         }
 
         std::vector<size_t> n_tensors(devices.size(), 0);
+        std::vector<char> need_k_base(devices.size(), 0);
         size_t n_tensors_host = 0;
         std::map<ggml_backend_buffer_type_t, int> n_tensors_host_bank;
         for (size_t il = 0; il < layers.size(); ++il) {
@@ -715,13 +674,9 @@ struct llama_moe_cache::impl {
                 if (!l.full) {
                     n_tensors[l.id] += 1;             // slot map
                     n_tensors_host  += 1;             // CPU map
-                    l.usage_idx = devices[l.id].usage_n_layers++;
-                    devices[l.id].usage_layers.push_back((int32_t) il);
-                    if (l.usage_idx == 0) {
-                        n_tensors[l.id] += 1;         // usage buffer of the device
-                        if (!devices[l.id].skip_negative) {
-                            n_tensors[l.id] += 1;     // expert position, only for the slot expression
-                        }
+                    if (!devices[l.id].skip_negative && !need_k_base[l.id]) {
+                        n_tensors[l.id] += 1;         // expert position, only for the slot expression
+                        need_k_base[l.id] = 1;
                     }
                 }
             }
@@ -752,19 +707,11 @@ struct llama_moe_cache::impl {
             }
         }
         for (device & d : devices) {
-            if (d.ctx && d.usage_n_layers > 0) {
-                d.usage = ggml_new_tensor_1d(d.ctx.get(), GGML_TYPE_I32, (int64_t) d.usage_n_layers*usage_rows_max);
-                ggml_format_name(d.usage, "moe_cache.usage-%d", (int) (&d - devices.data()));
-                if (!d.skip_negative) {
-                    d.k_base = ggml_new_tensor_1d(d.ctx.get(), GGML_TYPE_F32, n_used_max);
-                    ggml_format_name(d.k_base, "moe_cache.k_base-%d", (int) (&d - devices.data()));
-                }
+            if (d.ctx && need_k_base[&d - devices.data()]) {
+                d.k_base = ggml_new_tensor_1d(d.ctx.get(), GGML_TYPE_F32, n_used_max);
+                ggml_format_name(d.k_base, "moe_cache.k_base-%d", (int) (&d - devices.data()));
                 const size_t alignment = ggml_backend_buft_get_alignment(d.buft);
-                d.usage_bytes = ggml_nbytes(d.usage);
-                d.buf_size += GGML_PAD(d.usage_bytes, alignment);
-                if (d.k_base != nullptr) {
-                    d.buf_size += GGML_PAD(ggml_nbytes(d.k_base), alignment);
-                }
+                d.buf_size += GGML_PAD(ggml_nbytes(d.k_base), alignment);
             }
         }
         if (n_tensors_host > 0) {
@@ -961,15 +908,6 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
-        drain_usage();
-        for (device & d : devices) {
-            for (ggml_backend_event_t & ev : d.read_ev) {
-                if (ev != nullptr) {
-                    ggml_backend_event_free(ev);
-                    ev = nullptr;
-                }
-            }
-        }
         log_stats();
     }
 
@@ -1589,72 +1527,6 @@ struct llama_moe_cache::impl {
         n_selected_total += n;
     }
 
-    // count the selected experts of the layers of the device from a host copy of the usage buffer
-    void count_rows(device & d, const int32_t * base, const int32_t * rows_of) {
-        const int64_t t0 = trace ? ggml_time_us() : 0;
-        for (size_t idx = 0; idx < d.usage_layers.size(); ++idx) {
-            if (rows_of[idx] > 0) {
-                count_ids(d.usage_layers[idx], base + idx*usage_rows_max, rows_of[idx]);
-            }
-        }
-        if (trace) {
-            trace_count_us += ggml_time_us() - t0;
-        }
-    }
-
-    // host pointer of a readback slot of the device
-    const void * read_slot_ptr(const device & d, int32_t slot) const {
-        return (const uint8_t *) ggml_backend_buffer_get_base(d.read_slab.get()) + (size_t) slot*d.read_stride;
-    }
-
-    // make the readback slab of the device, allocated once and reused by the slots
-    void init_read_slab(device & d, ggml_backend_buffer_type_t buft_host) {
-        if (d.read_slab) {
-            return;
-        }
-        const size_t alignment = std::max<size_t>(1, ggml_backend_buft_get_alignment(buft_host));
-        d.read_stride = GGML_PAD(d.usage_bytes, alignment);
-        d.read_slab.reset(ggml_backend_buft_alloc_buffer(buft_host, d.read_stride*device::read_n_slots));
-        if (!d.read_slab) {
-            throw std::runtime_error("failed to allocate the MoE cache read buffer");
-        }
-        d.read_ev.resize(device::read_n_slots, nullptr);
-        for (int32_t i = device::read_n_slots - 1; i >= 0; --i) {
-            d.read_free.push_back(i);
-        }
-    }
-
-    // count the graph held by a readback slot of the device, the event may still be in flight
-    void count_read(device & d, int32_t slot, const std::vector<int32_t> & rows_of) {
-        if (d.read_ev[slot] != nullptr) {
-            ggml_backend_event_synchronize(d.read_ev[slot]);
-        } else {
-            ggml_backend_synchronize(d.backend);
-        }
-        count_rows(d, (const int32_t *) read_slot_ptr(d, slot), rows_of.data());
-    }
-
-    // count the graphs that are queued and release their buffers, called when the placement is decided
-    // or when the counters are read. no expert moves here
-    void drain_usage() {
-        std::lock_guard<std::mutex> lock(usage_mutex);
-        const int64_t t0 = trace ? ggml_time_us() : 0;
-        for (const usage_record & r : usage_queue) {
-            device & d = devices[r.dev];
-            count_read(d, r.slot, r.rows);
-            d.read_free.push_back(r.slot);
-        }
-        usage_queue.clear();
-        if (trace) {
-            trace_count_us += ggml_time_us() - t0;
-        }
-    }
-
-    // count the reads that are still in flight
-    void finish_reads() {
-        drain_usage();
-    }
-
     // rebalance the layers that collected enough selections, or all of them when forced, bounded by
     // the promotion budget. the budget starts with an equal share per layer so that high layer ids
     // do not starve, the leftover is used in a second pass
@@ -1815,7 +1687,6 @@ struct llama_moe_cache::impl {
         for (device & d : devices) {
             ggml_backend_synchronize(d.backend);
         }
-        finish_reads();
 
         // bound the duration of a rebalance with the measured promotion rate
         const size_t timed = (size_t) (promote_bytes_per_s*(double) budget_us/1e6);
@@ -1861,143 +1732,34 @@ struct llama_moe_cache::impl {
         GGML_UNUSED(moved);
     }
 
-    // the device storage that receives the selected experts of layer il for the next graph
-    ggml_tensor * get_usage(ggml_context * ctx, ggml_cgraph * gf, int32_t il, int64_t n_used, int64_t n_tokens) const {
-        const layer & l = layers[il];
-        if (l.id < 0 || l.usage_idx < 0) {
-            return nullptr;
-        }
-        const int64_t rows = n_used*n_tokens;
-        if (rows <= 0 || rows > usage_rows_max) {
-            return nullptr;
-        }
-        if (build_rows.empty()) {
-            build_rows.assign(layers.size(), 0);
-        }
-        build_rows[il] = (int32_t) rows;
-        build_gf       = gf;
-
-        const size_t offset = (size_t) l.usage_idx*usage_rows_max*sizeof(int32_t);
-        ggml_tensor * res = ggml_view_1d(ctx, devices[l.id].usage, rows, offset);
-        ggml_format_name(res, "moe_cache.usage-%d", (int) il);
-        return res;
-    }
-
-    // called after the graph compute is queued: read the selected experts back for the counters
-    void end(ggml_cgraph * gf) {
-        // a reused graph selects the same rows as when it was built
-        const bool built = building && gf == build_gf;
-        if (!built && gf != last_gf) {
+    // count the selected experts of a host split from the ids copy that the split already reads
+    void count_split(ggml_backend_t backend, ggml_cgraph * gf, ggml_backend_t backend_cpu) {
+        if (backend != backend_cpu || gf == nullptr) {
             return;
         }
-        const std::vector<int32_t> & rows_of = built ? build_rows : last_rows;
-        if (rows_of.empty()) {
-            return;
-        }
-        const int64_t t0 = trace ? ggml_time_us() : 0;
-
-        size_t rows_read  = 0;
-        size_t bytes_read = 0;
-        for (device & d : devices) {
-            if (d.usage == nullptr) {
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_GET_ROWS || node->src[0] == nullptr || node->src[1] == nullptr) {
                 continue;
             }
-            // rows of the layers of this device in this graph, by usage slice
-            d.read_rows_cur.resize(d.usage_layers.size());
-            size_t rows = 0;
-            for (size_t idx = 0; idx < d.usage_layers.size(); ++idx) {
-                d.read_rows_cur[idx] = rows_of[d.usage_layers[idx]];
-                rows = std::max<size_t>(rows, (size_t) d.read_rows_cur[idx]);
-            }
-            if (rows == 0) {
-                continue;
-            }
-            rows_read += rows;
-
-            ggml_backend_buffer_type_t buft_host = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(d.backend));
-            if (buft_host == nullptr) {
-                // no host buffer to read into without blocking
-                if (d.read_data.size() < d.usage_bytes) {
-                    d.read_data.resize(d.usage_bytes);
+            for (size_t il = 0; il < layers.size(); ++il) {
+                layer & l = layers[il];
+                if (l.id < 0 || l.cpu_map != node->src[0]) {
+                    continue;
                 }
-                ggml_backend_tensor_get(d.usage, d.read_data.data(), 0, d.usage_bytes);
-                count_rows(d, (const int32_t *) d.read_data.data(), d.read_rows_cur.data());
-                continue;
-            }
-            // the usage buffer holds the rows of every graph in the same layout, so the whole buffer is
-            // read back with one call into a slot of the slab. the record is counted later, at the
-            // placement or when the stats are read, so the submit thread does not wait for the readback
-            init_read_slab(d, buft_host);
-            int32_t slot = -1;
-            {
-                std::lock_guard<std::mutex> lock(usage_mutex);
-                if (!d.read_free.empty()) {
-                    slot = d.read_free.back();
-                    d.read_free.pop_back();
+                const ggml_tensor * ids = node->src[1];
+                if (ids->data != nullptr && ids->type == GGML_TYPE_I32) {
+                    count_ids((int32_t) il, (const int32_t *) ids->data, ggml_nelements(ids));
                 }
-            }
-            if (slot < 0) {
-                // all slots are in flight, count the queued graphs now
-                drain_usage();
-                std::lock_guard<std::mutex> lock(usage_mutex);
-                slot = d.read_free.back();
-                d.read_free.pop_back();
-            }
-            if (d.read_ev[slot] == nullptr) {
-                d.read_ev[slot] = ggml_backend_event_new(ggml_backend_get_device(d.backend));
-            }
-            if (d.read_ev[slot] == nullptr) {
-                // the backend has no events, count right away
-                ggml_backend_tensor_get(d.usage, const_cast<void *>(read_slot_ptr(d, slot)), 0, d.usage_bytes);
-                count_rows(d, (const int32_t *) read_slot_ptr(d, slot), d.read_rows_cur.data());
-                std::lock_guard<std::mutex> lock(usage_mutex);
-                d.read_free.push_back(slot);
-                continue;
-            }
-            ggml_backend_tensor_get_async(d.backend, d.usage, const_cast<void *>(read_slot_ptr(d, slot)), 0, d.usage_bytes);
-            ggml_backend_event_record(d.read_ev[slot], d.backend);
-            {
-                std::lock_guard<std::mutex> lock(usage_mutex);
-                usage_queue.push_back({ (int32_t) (&d - devices.data()), slot, d.read_rows_cur });
-            }
-
-            bytes_read += d.usage_bytes;
-            if (trace) {
-                trace_calls++;
-                trace_bytes += d.usage_bytes;
+                break;
             }
         }
-
-        if (trace) {
-            trace_graphs++;
-            trace_rows   += rows_read;
-            trace_end_us += ggml_time_us() - t0;
-            LLAMA_LOG_DEBUG("llama_moe_cache: graph %d nodes, %zu rows, %zu B read back, end %.0f us\n",
-                ggml_graph_n_nodes(gf), rows_read, bytes_read, (double) (ggml_time_us() - t0));
-        }
-        if (built) {
-            last_rows = build_rows;
-            last_gf   = gf;
-            building  = false;
-            build_gf  = nullptr;
-        }
-    }
-
-    // called before a graph is built, the selected rows of the new graph replace the cached ones
-    void new_graph() {
-        building = true;
-        last_gf  = nullptr;
-        build_gf = nullptr;
-        build_rows.clear();
     }
 
     void log_stats() const {
-        if (trace && trace_graphs > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: trace: %" PRIu64 " graphs, %" PRIu64 " readbacks (%.2f MiB, %" PRIu64 " rows), "
-                    "end %.2f ms (%.1f us/graph), count %.2f ms\n",
-                trace_graphs, trace_calls, trace_bytes/1024.0/1024.0, trace_rows,
-                trace_end_us/1000.0, (double) trace_end_us/std::max<uint64_t>(1, trace_graphs),
-                trace_count_us/1000.0);
+        if (trace && n_selected_total > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: trace: %" PRIu64 " selections, count %.2f ms\n",
+                n_selected_total, trace_count_us/1000.0);
         }
         if (n_selected_total == 0) {
             // a cache that holds whole layers computes them as a plain FFN, so it counts no selections
@@ -2053,20 +1815,8 @@ ggml_tensor * llama_moe_cache::get_host_experts(const ggml_tensor * w) const {
     return pimpl->get_host_experts(w);
 }
 
-ggml_tensor * llama_moe_cache::get_usage(ggml_context * ctx, ggml_cgraph * gf, int32_t il, int64_t n_used, int64_t n_tokens) const {
-    return pimpl->get_usage(ctx, gf, il, n_used, n_tokens);
-}
-
-void llama_moe_cache::end(ggml_cgraph * gf) {
-    pimpl->end(gf);
-}
-
-void llama_moe_cache::new_graph() {
-    pimpl->new_graph();
-}
-
-void llama_moe_cache::finish() {
-    pimpl->finish_reads();
+void llama_moe_cache::count_split(ggml_backend_t backend, ggml_cgraph * gf, ggml_backend_t backend_cpu) {
+    pimpl->count_split(backend, gf, backend_cpu);
 }
 
 void llama_moe_cache::rebalance() {

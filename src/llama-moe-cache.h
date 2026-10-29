@@ -87,19 +87,9 @@ public:
     // the host storage of the experts of w owned by the cache, nullptr if the model keeps the host copy
     ggml_tensor * get_host_experts(const ggml_tensor * w) const;
 
-    // the device buffer that receives the selected experts of layer il for this graph, nullptr if
-    // they do not fit. the graph must copy the ids into it, see end()
-    ggml_tensor * get_usage(ggml_context * ctx, ggml_cgraph * gf, int32_t il, int64_t n_used, int64_t n_tokens) const;
-
-    // called before a graph is built, the selected rows of the next graph replace the ones of the
-    // last build. a reused graph does not call it
-    void new_graph();
-
-    // called after the graph compute is queued: reads back the selected experts of this graph
-    void end(ggml_cgraph * gf);
-
-    // applies the selections that are still in flight, e.g. before the stats or a rebalance
-    void finish();
+    // count the experts selected by a host split of the graph, called from the split callback of the
+    // scheduler: the split reads the ids, so the counters cost no extra copy
+    void count_split(ggml_backend_t backend, ggml_cgraph * gf, ggml_backend_t backend_cpu);
 
     // move the most used experts, the devices must be idle, call only when no work is in flight
     // rebalance() runs after a prompt with a small budget and moves the clear winners,

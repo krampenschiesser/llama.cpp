@@ -752,6 +752,8 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
         const int pipe = env != nullptr && *env != '\0' ? atoi(env) : 3;
         ggml_backend_sched_set_async_copies(sched.get(), (pipe & 1) != 0);
         ggml_backend_sched_set_cpu_overlap(sched.get(), (pipe & 2) != 0);
+        // the host split of a cached layer counts the selected experts from the ids it reads
+        ggml_backend_sched_set_split_callback(sched.get(), sched_count_moe_ids, this);
     }
 }
 
@@ -935,8 +937,6 @@ llama_moe_cache_stats llama_context::moe_cache_stats() {
         res.enabled = false;
         return res;
     }
-    // apply the selections that are still in flight so the stats are exact
-    moe_cache->finish();
     return moe_cache->stats();
 }
 
@@ -1621,9 +1621,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        if (moe_cache) {
-            moe_cache->new_graph();
-        }
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -2758,9 +2755,6 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
-    if (moe_cache) {
-        moe_cache->new_graph();
-    }
     auto * gf = model.build_graph(gparams);
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
@@ -2861,14 +2855,16 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // queue the readback of the selected experts, the counters are applied by end() or finish()
-    if (moe_cache) {
-        moe_cache->end(gf);
-    }
-
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+void llama_context::sched_count_moe_ids(ggml_backend_t backend, ggml_cgraph * graph, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    if (lctx->moe_cache) {
+        lctx->moe_cache->count_split(backend, graph, lctx->backend_cpu);
+    }
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
@@ -3971,10 +3967,7 @@ void llama_context::opt_epoch_iter(
             gf_res_prev_active = nullptr;
             res->reset();
 
-            if (moe_cache) {
-        moe_cache->new_graph();
-    }
-    auto * gf = model.build_graph(gparams);
+            auto * gf = model.build_graph(gparams);
 
             struct ggml_context * ctx_compute_opt;
             {

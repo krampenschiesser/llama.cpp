@@ -283,6 +283,7 @@ private:
     void sched_new(size_t max_nodes, bool parallel);
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID from a host expert tensor
+    static void sched_count_moe_ids(ggml_backend_t backend, ggml_cgraph * graph, void * user_data);
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
