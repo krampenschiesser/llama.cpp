@@ -745,7 +745,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
     // the MoE cache splits every cached layer into a CPU half and a device half, both run at the same
-    // time: the copies cross backends asynchronously and the host split runs on a worker thread
+    // time: the copies cross backends asynchronously and the host split runs on a worker thread.
+    // both parts are needed: with the synchronous copies, or with the host split run inline, a cache
+    // rebalance can change the output, see the rebalance check in test-llama-archs
     if (moe_cache != nullptr) {
         ggml_backend_sched_set_async_copies(sched.get(), true);
         ggml_backend_sched_set_cpu_overlap(sched.get(), true);
