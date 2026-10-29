@@ -1779,7 +1779,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // a host split input that an earlier split produces is copied when that split is queued, so the
     // copy runs while the device computes the splits in between
     sched->n_prefetch = 0;
-    if (sched->async_copies) {
+    static const bool no_prefetch = getenv("GGML_SCHED_NO_PREFETCH") != NULL;
+    if (sched->async_copies && !no_prefetch) {
         for (int s = 0; s < sched->n_splits; s++) {
             struct ggml_backend_sched_split * split = &sched->splits[s];
             if (!ggml_backend_buft_is_host(sched->bufts[split->backend_id])) {

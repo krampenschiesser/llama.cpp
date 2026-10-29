@@ -31,8 +31,10 @@ Per cached layer and per graph:
 | `experts_cpu` host to device | `n_embd*n_used*n_tokens*4` | device stream, stream ordered |
 
 The device to host copies run on a second CUDA stream (`ggml_backend_copy_d2h`, optional, see
-`GGML_SCHED_NO_COPY_STREAM`). The host split waits for the copy event before it runs, the main
-thread never waits for a copy. The source tensors of the copies are marked as outputs of the graph
+`GGML_SCHED_NO_COPY_STREAM`). Each copy is issued as soon as the split that produces its source is
+queued, not when the host split starts, so it runs while the device computes the splits in between
+(optional, see `GGML_SCHED_NO_PREFETCH`). The host split waits for the copy event before it runs,
+the main thread never waits for a copy. The source tensors of the copies are marked as outputs of the graph
 so that the allocator does not reuse them before the copy has been consumed.
 
 The host split runs on a worker thread (`ggml_backend_sched_set_cpu_overlap`). The worker is joined
@@ -53,12 +55,13 @@ responsible:
 LLAMA_MOE_CACHE_PIPE        bit mask, 1 = async split copies, 2 = host split on a worker
                             (default 3, 0 restores the synchronous inline path)
 GGML_SCHED_NO_COPY_STREAM   keep the device to host copies on the compute stream (debug)
+GGML_SCHED_NO_PREFETCH      issue the copies at the consuming split instead of the producing one
 GGML_SCHED_DEBUG=2          print the split count and the copy counters of each compute
 LLAMA_MOE_CACHE_TRACE=1     per graph bookkeeping cost of the cache
 ```
 
-Copy counters of one decode graph of a 7 layer cache: `4 splits per layer, ~23 async copies,
-0 sync copies`.
+Copy counters of one decode graph of a 7 layer cache: `26 splits, ~23 async copies, 0 sync copies,
+14/14 prefetched`.
 
 ## Limits
 
