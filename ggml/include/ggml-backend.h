@@ -390,6 +390,9 @@ extern "C" {
     // a host split waits for its copies before it runs, so the device work after it can be queued
     GGML_API void                 ggml_backend_sched_set_async_copies(ggml_backend_sched_t sched, bool enable);
 
+    // Copy the host split inputs through pinned host memory of the source device
+    GGML_API void                 ggml_backend_sched_set_pinned_copies(ggml_backend_sched_t sched, bool enable);
+
     // Report the copy and synchronization counters of the last compute, debug only
     GGML_API void                 ggml_backend_sched_get_copy_stats(ggml_backend_sched_t sched, int * n_sync, int * n_async, int64_t * sync_us);
 

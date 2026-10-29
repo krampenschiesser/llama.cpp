@@ -1046,6 +1046,9 @@ struct ggml_backend_sched {
 
     // asynchronous copies of the split inputs that cross backends
     bool async_copies;
+    // host split inputs are copied through pinned memory, the async path and the blocking path are
+    // both faster when the destination does not have to be staged
+    bool pinned_copies;
     struct ggml_backend_sched_pinned pinned[GGML_SCHED_MAX_BACKENDS];
     // copy event of each split, waited before the split runs
     ggml_backend_event_t * split_events; // [splits_capacity]
@@ -1305,11 +1308,18 @@ static bool ggml_backend_sched_is_split_barrier(ggml_backend_sched_t sched, cons
     return false;
 }
 
-// an asynchronous copy may run on another stream until the host split consumes it, the source must
-// not be overwritten before that, so it stays alive until the end of the graph
+// the copy of a split input may read the source after the split that produces it was queued, so the
+// source must stay alive until the end of the graph. only the activations the graph computes: a leaf
+// or a weight lives outside of the graph and marking it as an output corrupts it
 static void ggml_backend_sched_keep_alive(struct ggml_tensor * t) {
     while (t->view_src != NULL) {
         t = t->view_src;
+    }
+    if (t->op == GGML_OP_NONE) {
+        return;
+    }
+    if (t->buffer != NULL && t->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return;
     }
     ggml_set_output(t);
 }
@@ -1757,12 +1767,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         }
                         split->inputs[n_inputs] = src;
 
-                        // a host split input that comes from a device is copied through pinned memory
-                        if (sched->async_copies && sched->n_copies == 1 &&
+                        // the copy reads the source after the split that produces it was queued, and a graph
+                        // replay may run that split at a different time, so keep the source allocated
+                        if (sched->pinned_copies) {
+                            ggml_backend_sched_keep_alive(src);
+                        }
+                        // a host split input that comes from a device is copied through pinned memory,
+                        // both copy paths are faster when the destination does not have to be staged
+                        if (sched->pinned_copies && sched->n_copies == 1 &&
                                 ggml_backend_buft_is_host(sched->bufts[cur_backend_id]) &&
                                 !ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(sched->backends[src_backend_id]))) {
                             ggml_backend_sched_pinned_alloc(sched, src_backend_id, tensor_id_copy(src_id, cur_backend_id, 0));
-                            ggml_backend_sched_keep_alive(src);
                         }
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
@@ -2767,6 +2782,11 @@ void ggml_backend_sched_set_split_barrier(ggml_backend_sched_t sched, struct ggm
         GGML_ABORT("%s: too many split barriers\n", __func__);
     }
     sched->split_barriers[sched->n_split_barriers++] = node;
+}
+
+void ggml_backend_sched_set_pinned_copies(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    sched->pinned_copies = enable;
 }
 
 void ggml_backend_sched_set_async_copies(ggml_backend_sched_t sched, bool enable) {
