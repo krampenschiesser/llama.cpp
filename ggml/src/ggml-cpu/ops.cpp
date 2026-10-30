@@ -9417,6 +9417,43 @@ static inline void ggml_fa_transpose_8x8_f32(__m256 * r) {
     r[6] = _mm256_permute2f128_ps(s2, s6, 0x31);
     r[7] = _mm256_permute2f128_ps(s3, s7, 0x31);
 }
+
+// In-register transpose of a 16x16 f32 block: r[j] becomes column j
+static inline void ggml_fa_transpose_16x16_f32(__m512 * r) {
+    // stage 1: unpack row pairs within each 128-bit lane
+    for (int i = 0; i < 8; i++) {
+        const __m512 lo = _mm512_unpacklo_ps(r[2*i], r[2*i+1]);
+        const __m512 hi = _mm512_unpackhi_ps(r[2*i], r[2*i+1]);
+        r[2*i]   = lo;
+        r[2*i+1] = hi;
+    }
+    // stage 2: after this r[4*g + k] lane L holds rows 4*g..4*g+3 of column 4*L + k
+    for (int g = 0; g < 4; g++) {
+        __m512 * a = r + 4*g;
+        const __m512 s0 = _mm512_shuffle_ps(a[0], a[2], 0x44);
+        const __m512 s1 = _mm512_shuffle_ps(a[0], a[2], 0xee);
+        const __m512 s2 = _mm512_shuffle_ps(a[1], a[3], 0x44);
+        const __m512 s3 = _mm512_shuffle_ps(a[1], a[3], 0xee);
+        a[0] = s0;
+        a[1] = s1;
+        a[2] = s2;
+        a[3] = s3;
+    }
+    // stage 3: r[4*L + k] becomes column 4*L + k, assembled from the 32-bit lane
+    // group L of the four row groups; one vpermi2ps per output column
+    for (int k = 0; k < 4; k++) {
+        const __m512 n0 = _mm512_shuffle_f32x4(r[k], r[4+k], 0x44);
+        const __m512 n1 = _mm512_shuffle_f32x4(r[k], r[4+k], 0xee);
+        const __m512 m0 = _mm512_shuffle_f32x4(r[8+k], r[12+k], 0x44);
+        const __m512 m1 = _mm512_shuffle_f32x4(r[8+k], r[12+k], 0xee);
+        const __m512i sel_lo = _mm512_set_epi32(27, 26, 25, 24, 19, 18, 17, 16, 11, 10, 9, 8, 3, 2, 1, 0);
+        const __m512i sel_hi = _mm512_set_epi32(31, 30, 29, 28, 23, 22, 21, 20, 15, 14, 13, 12, 7, 6, 5, 4);
+        r[k]    = _mm512_permutex2var_ps(n0, sel_lo, m0);
+        r[4+k]  = _mm512_permutex2var_ps(n0, sel_hi, m0);
+        r[8+k]  = _mm512_permutex2var_ps(n1, sel_lo, m1);
+        r[12+k] = _mm512_permutex2var_ps(n1, sel_hi, m1);
+    }
+}
 #endif
 
 static void ggml_compute_forward_flash_attn_ext_tiled(
@@ -9610,7 +9647,32 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 const int64_t k_off = ic*nbk1 + ik2*nbk2 + ik3*nbk3;
                 const int tk_vec_end = kv_tile & ~7;
 
-                for (int tk0 = 0; tk0 < tk_vec_end; tk0 += 8) {
+                // 16 KV entries per pass when the head dim allows it: one zmm per
+                // transposed row, half the per-element shuffle and store work of
+                // the 8-wide pass below
+                const int tk_vec_end1 = (DK % 16 == 0) ? (kv_tile & ~15) : 0;
+
+                for (int tk0 = 0; tk0 < tk_vec_end1; tk0 += 16) {
+                    const char * k0 = (const char *)k->data + k_off + tk0*nbk1;
+
+                    for (int64_t dk0 = 0; dk0 + 16 <= DK; dk0 += 16) {
+                        __m512 r[16];
+                        for (int i = 0; i < 16; i++) {
+                            const char * p = k0 + i*nbk1;
+                            if (kv_type == GGML_TYPE_F16) {
+                                r[i] = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)((const ggml_fp16_t *)p + dk0)));
+                            } else {
+                                r[i] = _mm512_loadu_ps((const float *)p + dk0);
+                            }
+                        }
+                        ggml_fa_transpose_16x16_f32(r);
+                        for (int j = 0; j < 16; j++) {
+                            _mm512_storeu_ps(K_f32 + (dk0 + j)*KV_TILE_SZ + tk0, r[j]);
+                        }
+                    }
+                }
+
+                for (int tk0 = tk_vec_end1; tk0 < tk_vec_end; tk0 += 8) {
                     const char * k0 = (const char *)k->data + k_off + tk0*nbk1;
 
                     int64_t dk0 = 0;

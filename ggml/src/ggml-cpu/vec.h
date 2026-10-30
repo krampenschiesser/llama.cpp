@@ -1828,7 +1828,13 @@ inline static void ggml_vec_geglu_quick_f16(const int n, ggml_fp16_t * y, const 
 }
 
 inline static void ggml_vec_geglu_quick_bf16(const int n, ggml_bf16_t * y, const ggml_bf16_t * x, const ggml_bf16_t * g) {
-    for (int i = 0; i < n; ++i) {
+    int i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    for (; i + 15 < n; i += 16) {
+        ggml_v_f32_to_bf16(y + i, _mm512_mul_ps(ggml_v_gelu_quick(ggml_v_bf16_to_f32(x + i)), ggml_v_bf16_to_f32(g + i)));
+    }
+#endif
+    for (; i < n; ++i) {
         y[i] = GGML_FP32_TO_BF16(ggml_gelu_quick_f32(GGML_BF16_TO_FP32(x[i])) * GGML_BF16_TO_FP32(g[i]));
     }
 }
