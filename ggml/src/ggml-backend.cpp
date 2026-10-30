@@ -1338,7 +1338,7 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 
-static int ggml_backend_sched_tensor_split(ggml_backend_sched_t sched, const struct ggml_tensor * t);
+static int ggml_backend_sched_tensor_split(ggml_backend_sched_t sched, struct ggml_tensor * t);
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
@@ -2409,9 +2409,9 @@ static bool ggml_backend_sched_copy_input_async(
 }
 
 // the split that computes a tensor, -1 if it is a leaf of the graph
-static int ggml_backend_sched_tensor_split(ggml_backend_sched_t sched, const struct ggml_tensor * t) {
-    for (const struct ggml_tensor * cur = t; cur != NULL; cur = cur->view_src) {
-        const int id = sched->hv_tensor_split_ids[ggml_hash_find_or_insert(&sched->hash_set, (struct ggml_tensor *) cur)];
+static int ggml_backend_sched_tensor_split(ggml_backend_sched_t sched, struct ggml_tensor * t) {
+    for (struct ggml_tensor * cur = t; cur != NULL; cur = cur->view_src) {
+        const int id = sched->hv_tensor_split_ids[ggml_hash_find_or_insert(&sched->hash_set, cur)];
         if (id >= 0) {
             return id;
         }

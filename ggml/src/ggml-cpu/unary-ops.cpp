@@ -173,7 +173,6 @@ static inline __m512 ggml_v_unary_f32(__m512 vx) {
 // xielu: alpha_p*x^2 + beta*x on the right, (expm1(min(x, eps)) - x)*alpha_n + beta*x on the left
 static inline void vec_unary_op_xielu_f32(int64_t n, float * y, const float * x,
         float alpha_n, float alpha_p, float beta, float eps, int64_t & i) {
-    const __m512 one = _mm512_set1_ps(1.0f);
     const __m512 va  = _mm512_set1_ps(alpha_n);
     const __m512 vp  = _mm512_set1_ps(alpha_p);
     const __m512 vb  = _mm512_set1_ps(beta);
